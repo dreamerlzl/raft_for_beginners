@@ -17,14 +17,27 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"bytes"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	logrus "github.com/sirupsen/logrus"
+
+	"labgob"
+	"labrpc"
+)
+
+var logLevel = logrus.DebugLevel
+var heartbeatPeriod = 100
+var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
+var electTimeoutRange = 250
+var applyPeriod = 2 * heartbeatPeriod
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +56,11 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	EntryTerm int
+	Command   interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -57,7 +75,71 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent
+	log         []LogEntry
+	lastIndex   int // the index of the last log entry
+	currentTerm int
+	votedFor    int
+
+	numPeers       int
+	state          State
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
+	commitIndex    int
+	lastApplied    int
+	applyCh        chan ApplyMsg
+	roleLock       sync.Mutex
+
+	// specific killing for this lab
+	killedChan [3]chan bool
+	killReply  chan bool
+	downgrade  bool
+	stale      bool // if true, then log is not up-to-date as a majority of other peers
+
+	// leader only
+	nextIndex  []int
+	matchIndex []int
 }
+
+func (rf *Raft) newElectionTimer() *time.Timer {
+	newElectionTimeout := rand.Intn(electTimeoutBase) + electTimeoutRange
+	return time.NewTimer(time.Duration(newElectionTimeout) * time.Millisecond)
+}
+
+func (rf *Raft) resetElectionTimer() {
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
+	newElectionTimeout := rand.Intn(electTimeoutBase) + electTimeoutRange
+	rf.electionTimer.Reset(time.Duration(newElectionTimeout) * time.Millisecond)
+	logrus.Debugf("[%d] resets election timer", rf.me)
+}
+
+func (rf *Raft) newHeartbeatTimer() {
+	rf.heartbeatTimer = time.NewTimer(time.Duration(heartbeatPeriod) * time.Millisecond)
+}
+
+func (rf *Raft) resetHeartbeatTimer() {
+	if !rf.heartbeatTimer.Stop() {
+		select {
+		case <-rf.heartbeatTimer.C:
+		default:
+		}
+	}
+	rf.heartbeatTimer.Reset(time.Duration(heartbeatPeriod) * time.Millisecond)
+	logrus.Debugf("[%d] resets heartbeat timer", rf.me)
+}
+
+type State int
+
+const (
+	leader State = iota
+	follower
+	candidate
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -66,6 +148,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isleader = (rf.state == leader)
+	term = rf.currentTerm
 	return term, isleader
 }
 
@@ -83,8 +169,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -106,32 +198,23 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
-
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var log []LogEntry
+	var currentTerm int
+	var votedFor int
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		logrus.Errorf("labgob decode error")
+	} else {
+		rf.log = log
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.lastIndex = len(rf.log) - 1
+	}
+	rf.resetElectionTimer()
+	logrus.Warnf("[%d] restarts with term %d!", rf.me, rf.currentTerm)
 }
 
 //
@@ -163,11 +246,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -186,11 +264,22 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	// Your code here (2B).
-
-
+	rf.mu.Lock()
+	if rf.state == leader {
+		isLeader = true
+		term = rf.currentTerm
+		rf.lastIndex++
+		index = rf.lastIndex
+		rf.log = append(rf.log, LogEntry{Command: command, EntryTerm: term})
+		rf.mu.Unlock()
+		logrus.Infof("[%d] start to propose entry{command: %v, term: %d} on index %d", rf.me, command, term, rf.lastIndex)
+		rf.persist()
+	} else {
+		rf.mu.Unlock()
+	}
 	return index, term, isLeader
 }
 
@@ -208,6 +297,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.killedChan[rf.state] <- true
+	logrus.Warnf("[%d] has been killed!", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -234,10 +325,50 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	logrus.SetLevel(logLevel)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		TimestampFormat: time.StampMilli,
+		FullTimestamp:   true,
+	})
+	rf.killedChan[follower] = make(chan bool)
+	rf.killedChan[leader] = make(chan bool) // never closed
+	rf.killedChan[candidate] = make(chan bool)
+	rf.killReply = make(chan bool)
+	rf.applyCh = applyCh
+	rf.currentTerm = 0
+	rf.log = append(rf.log, LogEntry{EntryTerm: rf.currentTerm}) // the first entry is dummy
+	rf.votedFor = -1                                             // -1 means vote for nothing
+	rf.lastIndex = 0                                             // log index starts with 1
+	rf.newHeartbeatTimer()
+	rf.electionTimer = rf.newElectionTimer()
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.numPeers = len(peers)
+	rf.nextIndex = make([]int, rf.numPeers)
+	for i := 0; i < rf.numPeers; i++ {
+		rf.nextIndex[i] = rf.lastIndex + 1
+	}
+
+	rf.matchIndex = make([]int, rf.numPeers)
+
+	// send applyMsg
+	go func() {
+		for !rf.killed() {
+			time.Sleep(time.Duration(applyPeriod))
+			if rf.commitIndex > rf.lastApplied {
+				rf.lastApplied++
+				applyMsg := ApplyMsg{Command: rf.log[rf.lastApplied].Command}
+				applyMsg.CommandIndex = rf.lastApplied
+				applyMsg.CommandValid = true
+				logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastApplied)
+				rf.applyCh <- applyMsg
+			}
+		}
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-
+	// intially a follower
+	rf.becomeFollower()
 	return rf
 }
