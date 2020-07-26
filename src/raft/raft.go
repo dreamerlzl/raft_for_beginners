@@ -331,7 +331,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		FullTimestamp:   true,
 	})
 	rf.killedChan[follower] = make(chan bool)
-	rf.killedChan[leader] = make(chan bool) // never closed
+	rf.killedChan[leader] = make(chan bool)
 	rf.killedChan[candidate] = make(chan bool)
 	rf.killReply = make(chan bool)
 	rf.applyCh = applyCh

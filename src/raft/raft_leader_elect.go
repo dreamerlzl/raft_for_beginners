@@ -93,7 +93,7 @@ func (rf *Raft) becomeLeader() {
 func (rf *Raft) becomeCandidate() {
 	stopListen := make(chan bool)
 	go func() {
-		for { // before acquiring the locak and change to candidate,
+		for { // before acquiring the lock and change to candidate,
 			// might experience multiple times of receiving higher terms
 			select {
 			case kill := <-rf.killedChan[follower]:
