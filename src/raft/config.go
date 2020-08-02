@@ -15,7 +15,7 @@ import (
 	"sync"
 	"testing"
 
-	"labrpc"
+	"../labrpc"
 
 	logrus "github.com/sirupsen/logrus"
 

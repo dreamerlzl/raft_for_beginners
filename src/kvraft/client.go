@@ -1,13 +1,22 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"../labrpc"
+	logrus "github.com/sirupsen/logrus"
+)
+
+var kvlogLevel = logrus.DebugLevel
+var rpcTimeout = 500
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clerkId    int64
+	lastLeader int
 }
 
 func nrand() int64 {
@@ -21,6 +30,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clerkId = nrand()
+	ck.lastLeader = 0
+	// time.Sleep(2 * time.Second) // wait for leader election
 	return ck
 }
 
@@ -39,7 +51,42 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+
+	args := GetArgs{
+		Key:       key,
+		ClerkId:   ck.clerkId,
+		RequestId: nrand(),
+	}
+	reply := GetReply{}
+
+	for i := ck.lastLeader; ; i = (i + 1) % len(ck.servers) {
+		ok := ck.getTimeout(i, &args, &reply)
+		if ok {
+			if reply.Err == OK {
+				ck.lastLeader = i
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				ck.lastLeader = i
+				return ""
+			}
+		}
+	}
+}
+
+func (ck *Clerk) getTimeout(kvserver int, args *GetArgs, reply *GetReply) bool {
+	ch := make(chan bool, 1)
+	rpcTimer := time.NewTimer(time.Duration(rpcTimeout) * time.Millisecond)
+	go func() {
+		ok := ck.servers[kvserver].Call("KVServer.Get", args, reply)
+		ch <- ok
+		close(ch)
+	}()
+	select {
+	case <-rpcTimer.C:
+		return false
+	case ok := <-ch:
+		return ok
+	}
 }
 
 //
@@ -54,6 +101,39 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Op:        op,
+		Key:       key,
+		Value:     value,
+		ClerkId:   ck.clerkId,
+		RequestId: nrand(),
+	}
+	reply := PutAppendReply{}
+
+	for i := ck.lastLeader; ; i = (i + 1) % len(ck.servers) {
+		ok := ck.putAppendTimeout(i, &args, &reply)
+		if ok && reply.Err == OK {
+			ck.lastLeader = i
+			return
+		}
+	}
+}
+
+func (ck *Clerk) putAppendTimeout(kvserver int, args *PutAppendArgs, reply *PutAppendReply) bool {
+	ch := make(chan bool, 1)
+	rpcTimer := time.NewTimer(time.Duration(rpcTimeout) * time.Millisecond)
+	go func() {
+		ok := ck.servers[kvserver].Call("KVServer.PutAppend", args, reply)
+		ch <- ok
+		close(ch)
+	}()
+
+	select {
+	case <-rpcTimer.C:
+		return false
+	case ok := <-ch:
+		return ok
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

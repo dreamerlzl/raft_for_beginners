@@ -1,15 +1,19 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
+	"fmt"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
+const checkLeaderPeriod = 100
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +22,24 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type      string
+	Key       string
+	Value     string
+	RequestId int64
+	ClerkId   int64
+}
+
+func op2string(op Op) string {
+	switch op.Type {
+	case "Get":
+		return fmt.Sprintf("{Get %s, RequestId: %d, ClerkId: %d}", op.Key, op.RequestId, op.ClerkId)
+	default:
+		return fmt.Sprintf("{%s %s with %s, RequestID: %d, ClerkId: %d}", op.Type, op.Key, op.Value, op.RequestId, op.ClerkId)
+	}
 }
 
 type KVServer struct {
@@ -35,15 +52,97 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data          map[string]string
+	lastRequestId map[int64]int64 // ClerkId -> last finished RequestId
+	applyResult   map[int]string
+	applyIndex    int
 }
 
+func (kv *KVServer) lock(msg string, f ...interface{}) {
+	kv.mu.Lock()
+	// logrus.Infof("[%d]"+msg, kv.me)
+	DPrintf(msg, f...)
+}
+
+func (kv *KVServer) unlock(msg string, f ...interface{}) {
+	kv.mu.Unlock()
+	// logrus.Infof("[%d]"+msg, kv.me)
+	DPrintf(msg, f...)
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Type:      "Get",
+		Key:       args.Key,
+		RequestId: args.RequestId,
+		ClerkId:   args.ClerkId,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[kv %d] issues %s at index %d", kv.me, op2string(op), index)
+
+	period := time.Duration(checkLeaderPeriod) * time.Millisecond
+	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
+		// periodically check the currentTerm and apply result
+		time.Sleep(period)
+		currentTerm, isleader := kv.rf.GetState()
+		if !(term == currentTerm && isleader) {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		kv.lock("[kv %d] is reading index %d's result", kv.me, index)
+		if kv.applyIndex >= index {
+			result := kv.applyResult[index]
+			delete(kv.applyResult, index)
+			kv.unlock("[kv %d] finished reading index %d's result", kv.me, index)
+			if result == "" {
+				reply.Err = ErrNoKey
+			} else {
+				reply.Err = OK
+				reply.Value = result
+			}
+			return
+		} else {
+			kv.unlock("[kv %d] finished reading index %d's result", kv.me, index)
+		}
+	}
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Type:      args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		RequestId: args.RequestId,
+		ClerkId:   args.ClerkId,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[kv %d] issues %s at index %d", kv.me, op2string(op), index)
+	// as said in hints, a client will make only one call into a Clerk at a time.
+	period := time.Duration(checkLeaderPeriod) * time.Millisecond
+	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
+		// periodically check the currentTerm and apply result
+		time.Sleep(period)
+		currentTerm, isleader := kv.rf.GetState()
+		if !(term == currentTerm && isleader) {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		if kv.applyIndex >= index {
+			reply.Err = OK
+			return
+		}
+	}
 }
 
 //
@@ -91,11 +190,62 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	kv.data = make(map[string]string)
+	kv.lastRequestId = make(map[int64]int64)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.applyIndex = 0 // as raft, 1 is the first meaingful index
+	kv.applyResult = make(map[int]string)
 	// You may need initialization code here.
-
+	go func() {
+		for {
+			applyMsg := <-kv.applyCh
+			if applyMsg.CommandValid {
+				if kv.applyIndex+1 != applyMsg.CommandIndex {
+					DPrintf("[kv %d] application not in order! expected: %d, given: %d", kv.me, kv.applyIndex+1, applyMsg.CommandIndex)
+					continue
+				}
+				op := applyMsg.Command.(Op)
+				value := kv.applyOp(op)
+				kv.lock("[kv %d] writes result for index %d", kv.me, applyMsg.CommandIndex)
+				if op.Type == "Get" {
+					kv.applyResult[applyMsg.CommandIndex] = value
+				}
+				kv.applyIndex++
+				kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
+			}
+		}
+	}()
 	return kv
+}
+
+func (kv *KVServer) applyOp(op Op) string {
+	kv.lock("[kv %d] starts to apply %s", kv.me, op2string(op))
+	defer kv.unlock("[kv %d] finishes apply %d", kv.me, op.RequestId)
+	if kv.lastRequestId[op.ClerkId] == op.RequestId {
+		// duplicate execution
+		DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
+		switch op.Type {
+		case "Get":
+			return kv.data[op.Key]
+		default:
+			return ""
+		}
+	} else {
+		kv.lastRequestId[op.ClerkId] = op.RequestId
+		switch op.Type {
+		case "Get":
+			v, ok := kv.data[op.Key]
+			if ok {
+				return v
+			} else {
+				return ""
+			}
+		case "Put":
+			kv.data[op.Key] = op.Value
+		case "Append":
+			kv.data[op.Key] += op.Value
+		}
+		return ""
+	}
 }

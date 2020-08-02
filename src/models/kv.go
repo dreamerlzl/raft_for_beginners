@@ -10,6 +10,19 @@ type KvInput struct {
 	Value string
 }
 
+func (kv *KvInput) ToString()string{
+	var op string 
+	switch kv.Op{
+	case 0:
+		op = "get"
+	case 1:
+		op = "put"
+	case 2:
+		op = "append"
+	}
+	return fmt.Sprintf("{op: %s, key:\"%s\", value: \"%s\"}", op, kv.Key, kv.Value)
+}
+
 type KvOutput struct {
 	Value string
 }

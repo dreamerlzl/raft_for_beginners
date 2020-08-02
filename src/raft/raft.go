@@ -26,11 +26,11 @@ import (
 
 	logrus "github.com/sirupsen/logrus"
 
-	"labgob"
-	"labrpc"
+	"../labgob"
+	"../labrpc"
 )
 
-var logLevel = logrus.DebugLevel
+var logLevel = logrus.WarnLevel
 var heartbeatPeriod = 100
 var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
 var electTimeoutRange = 250
@@ -65,12 +65,12 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
-
+	mu             sync.Mutex          // Lock to protect shared access to this peer's state
+	peers          []*labrpc.ClientEnd // RPC end points of all peers
+	persister      *Persister          // Object to hold this peer's persisted state
+	me             int                 // this peer's index into peers[]
+	dead           int32               // set by Kill()
+	AcceptedLeader int
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -323,7 +323,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.AcceptedLeader = -1
 	// Your initialization code here (2A, 2B, 2C).
 	logrus.SetLevel(logLevel)
 	logrus.SetFormatter(&logrus.TextFormatter{

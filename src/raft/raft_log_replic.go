@@ -51,7 +51,9 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs) {
 		if rf.nextIndex[server] > rf.lastIndex+1 {
 			logrus.Errorf("[%d] nextIndex[%d]=%d > lastIndex+1=%d", rf.me, server, rf.nextIndex[server], rf.lastIndex+1)
 		}
-		args.Entries = rf.log[rf.nextIndex[server] : rf.lastIndex+1]
+		// args.Entries = rf.log[rf.nextIndex[server] : rf.lastIndex+1]
+		args.Entries = make([]LogEntry, rf.lastIndex+1-rf.nextIndex[server])
+		copy(args.Entries, rf.log[rf.nextIndex[server]:])
 		args.PrevLogIndex = rf.nextIndex[server] - 1
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].EntryTerm
 		lastIndex := rf.lastIndex
@@ -164,6 +166,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = MinInt(args.LeaderCommit, firstConflictIndex+len(args.Entries)-1)
 			logrus.Debugf("[%d]'s commitIndex: %d", rf.me, rf.commitIndex)
 		}
+		rf.AcceptedLeader = args.LeaderId
 		if lenAppendEntries == 0 {
 			logrus.Debugf("[%d] receives heartbeat with term %d from leader %d",
 				rf.me, args.SenderTerm, args.LeaderId)
