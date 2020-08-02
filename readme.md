@@ -1,15 +1,12 @@
 ## Setup
-- under current directory, set GOPATH (I don't use relative import)
-```bash
-export GOPATH=${PWD}
-```
+- use relative import instead of setting `GOPATH` as the current dir
 - install logrus
 ```bash
 go get "github.com/sirupsen/logrus"
 ```
 
 ## Test
-- 
+- need python 3.5 or higher
 ```bash
 cd src/raft
 python many_test.py [-np num_cores] [-t num_test] [-l time_limit] TestRegex
@@ -22,5 +19,5 @@ python many_test.py [-np num_cores] [-t num_test] [-l time_limit] TestRegex
 - time setting: see `raft.go`
     - period for sending heartbeats: 100 ms
     - election timeout: a random number within 250 ~ 500 ms
-- For slow CPU(例如英特尔4代的CPU), may need to set larger election timeout 
+- For slow CPU(like Intel 4th generation CPU), may need to set larger election timeout 
     - otherwise may fail `one()` because of slow heartbeat broadcasting

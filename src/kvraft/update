@@ -1,2 +1,0 @@
-#!/bin/bash
-scp client.go server.go common.go lin@dell:~/Documents/src/kvraft/
