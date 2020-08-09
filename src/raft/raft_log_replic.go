@@ -20,6 +20,7 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictTerm  int
 	ConflictIndex int
+	NeedSnapshot  bool
 }
 
 func (rf *Raft) bcastAppendEntries() {
@@ -51,11 +52,17 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs) {
 		if rf.nextIndex[server] > rf.lastIndex+1 {
 			logrus.Errorf("[%d] nextIndex[%d]=%d > lastIndex+1=%d", rf.me, server, rf.nextIndex[server], rf.lastIndex+1)
 		}
-		// args.Entries = rf.log[rf.nextIndex[server] : rf.lastIndex+1]
+
+		if rf.nextIndex[server] <= rf.lastIncludedIndex {
+			rf.mu.Unlock()
+			go rf.sendInstallSnapshot(server)
+			return
+		}
+
 		args.Entries = make([]LogEntry, rf.lastIndex+1-rf.nextIndex[server])
-		copy(args.Entries, rf.log[rf.nextIndex[server]:])
+		copy(args.Entries, rf.getLogEntries(rf.nextIndex[server], rf.lastIndex+1))
 		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].EntryTerm
+		args.PrevLogTerm = rf.getLogEntry(args.PrevLogIndex).EntryTerm
 		lastIndex := rf.lastIndex
 		rf.mu.Unlock()
 		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
@@ -72,7 +79,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs) {
 
 					// logrus.Debugf("[%d] matches %d with follower %d", rf.me, rf.matchIndex[server], server)
 					// logrus.Debugf("[%d] lastIndex: %d", rf.me, rf.lastIndex)
-					// logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, lastIndex+1)
+					logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, lastIndex+1)
 
 					rf.updateCommitIndex(server)
 				} else {
@@ -87,20 +94,27 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs) {
 				rf.mu.Unlock()
 				return
 			} else {
-				found := false
-				if rf.nextIndex[server]-1 > rf.lastIndex {
-					logrus.Errorf("[%d] lastIndex: %d, nextIndex[%d]: %d", rf.me, rf.lastIndex, server, rf.nextIndex[server])
-				}
-				for i := rf.nextIndex[server] - 1; i > -1; i-- {
-					if rf.log[i].EntryTerm == reply.ConflictTerm {
-						rf.nextIndex[server] = i + 1
-						logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, i+1)
-						found = true
-						break
+				if !reply.NeedSnapshot {
+					found := false
+					if rf.nextIndex[server]-1 > rf.lastIndex {
+						logrus.Errorf("[%d] lastIndex: %d, nextIndex[%d]: %d", rf.me, rf.lastIndex, server, rf.nextIndex[server])
+					}
+					for i := rf.nextIndex[server] - 1; i >= rf.lastIncludedIndex; i-- {
+						if rf.getLogEntry(i).EntryTerm == reply.ConflictTerm {
+							rf.nextIndex[server] = i + 1
+							logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, i+1)
+							found = true
+							break
+						}
+					}
+					if !found {
+						rf.nextIndex[server] = reply.ConflictIndex
+						logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, reply.ConflictIndex)
 					}
 				}
-				if !found {
-					rf.nextIndex[server] = reply.ConflictIndex
+				if rf.nextIndex[server] < rf.lastIncludedIndex || reply.NeedSnapshot {
+					// installSnapshot RPC
+					go rf.sendSnapshot(server)
 				}
 				logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, rf.nextIndex[server])
 			}
@@ -128,12 +142,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		logrus.Debugf("[%d] log inconsistent with leader %d; lastIndex: %d, PrevLogIndex: %d", rf.me, args.LeaderId, rf.lastIndex, args.PrevLogIndex)
 		reply.ConflictIndex = rf.lastIndex + 1
 		reply.ConflictTerm = -1
-	} else if rf.log[args.PrevLogIndex].EntryTerm != args.PrevLogTerm {
-		logrus.Debugf("[%d] log inconsistent with leader %d; index: %d,  my term: %d, leader term: %d", rf.me, args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].EntryTerm, args.PrevLogTerm)
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].EntryTerm
-		for i := args.PrevLogIndex; i > -1; i-- {
-			if rf.log[i].EntryTerm < reply.ConflictTerm {
+	} else if rf.getLogEntry(args.PrevLogIndex).EntryTerm != args.PrevLogTerm {
+		logrus.Debugf("[%d] log inconsistent with leader %d; index: %d,  my term: %d, leader term: %d", rf.me, args.LeaderId, args.PrevLogIndex, rf.getLogEntry(args.PrevLogIndex).EntryTerm, args.PrevLogTerm)
+		reply.ConflictTerm = rf.getLogEntry(args.PrevLogIndex).EntryTerm
+		reply.NeedSnapshot = true
+		for i := args.PrevLogIndex; i >= rf.lastIncludedIndex; i-- {
+			if rf.getLogEntry(i).EntryTerm < reply.ConflictTerm {
 				reply.ConflictIndex = i + 1
+				reply.NeedSnapshot = false
 				break
 			}
 		}
@@ -144,18 +160,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		reply.Success = true
 		// logrus.Debugf("[%d] successfully receives leader %d's appendEntries", rf.me, args.LeaderId)
-		myLogLength := len(rf.log)
+		myLogLength := rf.getLogLength()
 		base := args.PrevLogIndex + 1
 		firstConflictIndex := myLogLength // by default assume no conflicts
 		lenAppendEntries := len(args.Entries)
 		for i := 0; i < MinInt(lenAppendEntries, myLogLength-base); i++ {
-			if rf.log[i+base].EntryTerm != args.Entries[i].EntryTerm {
+			if rf.getLogEntry(i+base).EntryTerm != args.Entries[i].EntryTerm {
 				firstConflictIndex = i + base
 				break
 			}
 		}
-		rf.log = append(rf.log[:firstConflictIndex],
-			args.Entries[MinInt(firstConflictIndex-base, lenAppendEntries):]...)
+		rf.replaceLogEntries(firstConflictIndex, args.Entries[MinInt(firstConflictIndex-base, lenAppendEntries):])
 		rf.persist()
 		if !(firstConflictIndex == myLogLength && myLogLength-base > lenAppendEntries) {
 			rf.lastIndex = args.PrevLogIndex + lenAppendEntries
@@ -195,9 +210,9 @@ func (rf *Raft) updateCommitIndex(server int) {
 	n := (rf.numPeers - 1) / 2
 	N := tmp[n]
 
-	// logrus.Debugf("[%d] N: %d commitIndex: %d term: %d currentTerm: %d", rf.me, N, rf.commitIndex, rf.log[N].EntryTerm, rf.currentTerm)
+	// logrus.Debugf("[%d] N: %d commitIndex: %d term: %d currentTerm: %d", rf.me, N, rf.commitIndex, rf.getLogEntry(N).EntryTerm, rf.currentTerm)
 
-	if N > rf.commitIndex && rf.log[N].EntryTerm == rf.currentTerm {
+	if N > rf.commitIndex && rf.getLogEntry(N).EntryTerm == rf.currentTerm {
 		rf.commitIndex = tmp[n]
 		logrus.Infof("[%d]'s commitIndex updates to %d", rf.me, tmp[n])
 	}

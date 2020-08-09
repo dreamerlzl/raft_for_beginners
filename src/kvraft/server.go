@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -14,6 +15,8 @@ import (
 
 const Debug = 1
 const checkLeaderPeriod = 100
+const checkSnapshotPeriod = 300
+const ratio float32 = 0.85 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -56,6 +59,11 @@ type KVServer struct {
 	lastRequestId map[int64]int64 // ClerkId -> last finished RequestId
 	applyResult   map[int]string
 	applyIndex    int
+}
+
+type KVSnapshot struct {
+	Data          map[string]string
+	LastRequestId map[int64]string
 }
 
 func (kv *KVServer) lock(msg string, f ...interface{}) {
@@ -196,6 +204,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.applyIndex = 0 // as raft, 1 is the first meaingful index
 	kv.applyResult = make(map[int]string)
+
+	// read snapshot
+	kv.loadSnapshot(kv.rf.GetSnapshot())
+
 	// You may need initialization code here.
 	go func() {
 		for {
@@ -213,7 +225,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 				kv.applyIndex++
 				kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
+			} else {
+				// update the data with snapshot
+				kv.applyIndex = applyMsg.LastIncludedIndex
+				kv.loadSnapshot(applyMsg.Snapshot)
 			}
+		}
+	}()
+
+	// periodically check whether need to take a snapshot
+	go func() {
+		for {
+			if kv.rf.GetStateSize() >= int(ratio*float32(kv.maxraftstate)) {
+				snapshot := kv.encodeSnapshot()
+				kv.rf.TakeSnapshot(snapshot)
+			}
+			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)
 		}
 	}()
 	return kv
@@ -247,5 +274,34 @@ func (kv *KVServer) applyOp(op Op) string {
 			kv.data[op.Key] += op.Value
 		}
 		return ""
+	}
+}
+
+func (kv *KVServer) encodeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.data) != nil {
+		panic("fail to encode kv.data!")
+	}
+	if e.Encode(kv.lastRequestId) != nil {
+		panic("fail to encode kv.lastRequestId!")
+	}
+	return w.Bytes()
+}
+
+func (kv *KVServer) loadSnapshot(snapshot []byte) {
+	if len(snapshot) > 0 {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		var data map[string]string
+		var lastRequestId map[int64]int64
+		if d.Decode(&data) != nil ||
+			d.Decode(&lastRequestId) != nil {
+			DPrintf("[%d] fails to read snapshot!", kv.me)
+			panic("fail to read snapshot")
+		}
+		kv.data = data
+		kv.lastRequestId = lastRequestId
+		DPrintf("[kv %d] successfully load snapshot!", kv.me)
 	}
 }

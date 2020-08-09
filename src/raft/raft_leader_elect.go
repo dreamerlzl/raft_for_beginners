@@ -41,7 +41,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.ReceiverTerm = rf.currentTerm
 	turnToFollower := rf.currentTerm < args.SenderTerm
 	if turnToFollower || (rf.currentTerm == args.SenderTerm && rf.votedFor == -1) {
-		lastTerm := rf.log[rf.lastIndex].EntryTerm
+		lastTerm := rf.getLogEntry(rf.lastIndex).EntryTerm
 		if turnToFollower {
 			logrus.Infof("[%d] (term %d) receives request vote from %d with larger term %d", rf.me, rf.currentTerm, args.CandidateId, args.SenderTerm)
 			rf.updateCurrentTerm(args.SenderTerm) // must update here
@@ -134,7 +134,7 @@ func (rf *Raft) becomeCandidate() {
 		rf.resetElectionTimer()
 		args := &RequestVoteArgs{CandidateId: rf.me, SenderTerm: rf.currentTerm}
 		args.LastLogIndex = rf.lastIndex
-		args.LastLogTerm = rf.log[rf.lastIndex].EntryTerm
+		args.LastLogTerm = rf.getLogEntry(rf.lastIndex).EntryTerm
 		numPeers := len(rf.peers)
 		rf.mu.Unlock()
 		rf.persist()

@@ -30,7 +30,7 @@ import (
 	"../labrpc"
 )
 
-var logLevel = logrus.WarnLevel
+var logLevel = logrus.DebugLevel
 var heartbeatPeriod = 100
 var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
 var electTimeoutRange = 250
@@ -51,9 +51,11 @@ var applyPeriod = 2 * heartbeatPeriod
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
 type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
+	CommandValid      bool
+	Command           interface{}
+	CommandIndex      int
+	Snapshot          []byte
+	LastIncludedIndex int
 }
 
 type LogEntry struct {
@@ -76,11 +78,14 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persistent
-	log         []LogEntry
-	lastIndex   int // the index of the last log entry
-	currentTerm int
-	votedFor    int
+	log               []LogEntry
+	lastIndex         int // the index of the last log entry
+	currentTerm       int
+	votedFor          int
+	lastIncludedIndex int // the number of deleted log entries
+	lastIncludedTerm  int
 
+	// can be non-persistent
 	numPeers       int
 	state          State
 	electionTimer  *time.Timer
@@ -99,6 +104,18 @@ type Raft struct {
 	// leader only
 	nextIndex  []int
 	matchIndex []int
+}
+
+func (rf *Raft) lock(msg string, f ...interface{}) {
+	rf.mu.Lock()
+	// logrus.Infof("[%d]"+msg, kv.me)
+	logrus.Debugf(msg, f...)
+}
+
+func (rf *Raft) unlock(msg string, f ...interface{}) {
+	rf.mu.Unlock()
+	// logrus.Infof("[%d]"+msg, kv.me)
+	logrus.Debugf(msg, f...)
 }
 
 func (rf *Raft) newElectionTimer() *time.Timer {
@@ -133,6 +150,38 @@ func (rf *Raft) resetHeartbeatTimer() {
 	logrus.Debugf("[%d] resets heartbeat timer", rf.me)
 }
 
+func (rf *Raft) getLogEntry(index int) LogEntry {
+	return rf.log[index-rf.lastIncludedIndex]
+}
+
+func (rf *Raft) getLogEntries(start, end int) []LogEntry {
+	if start < rf.lastIncludedIndex {
+		logrus.Errorf("[%d] lastIncludedIndex: %d start: %d end: %d", rf.me, rf.lastIncludedIndex, start, end)
+		panic("index out of bound")
+	}
+	return rf.log[start-rf.lastIncludedIndex : end-rf.lastIncludedIndex]
+}
+
+func (rf *Raft) getLogLength() int {
+	return len(rf.log) + rf.lastIncludedIndex
+}
+
+func (rf *Raft) appendLogEntry(entry LogEntry) {
+	rf.log = append(rf.log, entry)
+}
+
+func (rf *Raft) appendLogEntries(entries []LogEntry) {
+	rf.log = append(rf.log, entries...)
+}
+
+func (rf *Raft) replaceLogEntries(pos int, entries []LogEntry) {
+	rf.log = append(rf.getLogEntries(rf.lastIncludedIndex, pos), entries...)
+}
+
+func (rf *Raft) trimEntries(index int) {
+	rf.log = rf.log[index-rf.lastIncludedIndex:]
+}
+
 type State int
 
 const (
@@ -160,21 +209,20 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
+func (rf *Raft) encodeRaftState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.log)
-	data := w.Bytes()
+	return w.Bytes()
+}
+
+func (rf *Raft) persist() {
+	data := rf.encodeRaftState()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -203,15 +251,20 @@ func (rf *Raft) readPersist(data []byte) {
 	var log []LogEntry
 	var currentTerm int
 	var votedFor int
+	var lastIncludedIndex, lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&log) != nil {
 		logrus.Errorf("labgob decode error")
 	} else {
 		rf.log = log
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.lastIndex = len(rf.log) - 1
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		rf.lastIndex = lastIncludedIndex + len(rf.log) - 1
 	}
 	rf.resetElectionTimer()
 	logrus.Warnf("[%d] restarts with term %d!", rf.me, rf.currentTerm)
@@ -273,7 +326,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		rf.lastIndex++
 		index = rf.lastIndex
-		rf.log = append(rf.log, LogEntry{Command: command, EntryTerm: term})
+		rf.appendLogEntry(LogEntry{Command: command, EntryTerm: term})
 		rf.mu.Unlock()
 		logrus.Infof("[%d] start to propose entry{command: %v, term: %d} on index %d", rf.me, command, term, rf.lastIndex)
 		rf.persist()
@@ -336,19 +389,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.killReply = make(chan bool)
 	rf.applyCh = applyCh
 	rf.currentTerm = 0
-	rf.log = append(rf.log, LogEntry{EntryTerm: rf.currentTerm}) // the first entry is dummy
-	rf.votedFor = -1                                             // -1 means vote for nothing
-	rf.lastIndex = 0                                             // log index starts with 1
+	rf.appendLogEntry(LogEntry{EntryTerm: rf.currentTerm}) // the first entry is dummy
+	rf.votedFor = -1                                       // -1 means vote for nothing
+	rf.lastIndex = 0                                       // log index starts with 1
 	rf.newHeartbeatTimer()
 	rf.electionTimer = rf.newElectionTimer()
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.numPeers = len(peers)
 	rf.nextIndex = make([]int, rf.numPeers)
-	for i := 0; i < rf.numPeers; i++ {
-		rf.nextIndex[i] = rf.lastIndex + 1
-	}
-
 	rf.matchIndex = make([]int, rf.numPeers)
 
 	// send applyMsg
@@ -357,11 +406,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			time.Sleep(time.Duration(applyPeriod))
 			if rf.commitIndex > rf.lastApplied {
 				rf.lastApplied++
-				applyMsg := ApplyMsg{Command: rf.log[rf.lastApplied].Command}
-				applyMsg.CommandIndex = rf.lastApplied
-				applyMsg.CommandValid = true
-				logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastApplied)
-				rf.applyCh <- applyMsg
+				if rf.lastApplied > rf.lastIncludedIndex {
+					applyMsg := ApplyMsg{
+						Command:      rf.getLogEntry(rf.lastApplied).Command,
+						CommandIndex: rf.lastApplied,
+						CommandValid: true,
+					}
+					logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastApplied)
+					rf.applyCh <- applyMsg
+				}
 			}
 		}
 	}()
