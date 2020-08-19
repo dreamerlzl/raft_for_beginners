@@ -91,7 +91,7 @@ type Raft struct {
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 	commitIndex    int
-	lastApplied    int
+	lastSent       int
 	applyCh        chan ApplyMsg
 	roleLock       sync.Mutex
 
@@ -267,7 +267,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIndex = lastIncludedIndex + len(rf.log) - 1
 	}
 	rf.resetElectionTimer()
-	logrus.Warnf("[%d] restarts with term %d!", rf.me, rf.currentTerm)
+	logrus.Warnf("[%d] restarts with term %d, lastIncludedIndex: %d!", rf.me, rf.currentTerm, rf.lastIncludedIndex)
 }
 
 //
@@ -396,30 +396,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.newHeartbeatTimer()
 	rf.electionTimer = rf.newElectionTimer()
 	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.lastSent = 0
 	rf.numPeers = len(peers)
 	rf.nextIndex = make([]int, rf.numPeers)
 	rf.matchIndex = make([]int, rf.numPeers)
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 	// send applyMsg
 	go func() {
 		for !rf.killed() {
 			time.Sleep(time.Duration(applyPeriod))
-			for rf.lastApplied < rf.commitIndex {
-				rf.lastApplied++
+			for rf.lastSent = MaxInt(rf.lastIncludedIndex, rf.lastSent); rf.lastSent < rf.commitIndex; {
+				rf.lastSent++
 				applyMsg := ApplyMsg{
-					Command:      rf.getLogEntry(rf.lastApplied).Command,
-					CommandIndex: rf.lastApplied,
+					Command:      rf.getLogEntry(rf.lastSent).Command,
+					CommandIndex: rf.lastSent,
 					CommandValid: true,
 				}
-				logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastApplied)
+				logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastSent)
 				rf.applyCh <- applyMsg
 			}
 		}
 	}()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 	// intially a follower
 	rf.becomeFollower()
 	return rf

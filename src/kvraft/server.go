@@ -196,6 +196,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	DPrintf("[kv %d] server starts!", kv.me)
 	kv.data = make(map[string]string)
 	kv.lastRequestId = make(map[int64]int64)
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -213,20 +214,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			if applyMsg.CommandValid {
 				if kv.applyIndex+1 != applyMsg.CommandIndex {
 					DPrintf("[kv %d] application not in order! expected: %d, given: %d", kv.me, kv.applyIndex+1, applyMsg.CommandIndex)
-					continue
+					panic("application not in order")
 				}
 				op := applyMsg.Command.(Op)
-				if kv.lastRequestId[op.ClerkId] == op.RequestId {
-					// duplicate execution
-					DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
+				DPrintf("[kv %d] receives op with index: %d\nrequest Id: %d\n", kv.me, applyMsg.CommandIndex, op.RequestId)
+				if op.Type == "Get" {
+					kv.lock("[kv %d] writes result for index %d", kv.me, applyMsg.CommandIndex)
+					kv.applyResult[applyMsg.CommandIndex] = kv.applyOp(op)
+					kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
 				} else {
-					value := kv.applyOp(op)
-					if op.Type == "Get" {
-						kv.lock("[kv %d] writes result for index %d", kv.me, applyMsg.CommandIndex)
-						kv.applyResult[applyMsg.CommandIndex] = value
-						kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
+					if kv.lastRequestId[op.ClerkId] == op.RequestId {
+						// duplicate execution
+						DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
+					} else {
+						kv.applyOp(op)
+						// logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d\n", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
+						kv.lastRequestId[op.ClerkId] = op.RequestId
 					}
-					kv.lastRequestId[op.ClerkId] = op.RequestId
 				}
 				kv.applyIndex++
 			} else {
@@ -241,8 +245,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go func() {
 		for {
 			if kv.rf.GetStateSize() >= int(ratio*float32(kv.maxraftstate)) {
+				kv.lock("[kv %d] starts to encode snapshot", kv.me)
 				snapshot := kv.encodeSnapshot()
-				kv.rf.TakeSnapshot(snapshot)
+				applyIndex := kv.applyIndex
+				kv.unlock("[kv %d] finishes encoding snapshot", kv.me)
+				kv.rf.TakeSnapshot(snapshot, applyIndex)
 			}
 			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)
 		}
@@ -273,6 +280,9 @@ func (kv *KVServer) encodeSnapshot() []byte {
 	if e.Encode(kv.applyIndex) != nil {
 		panic("fail to encode kv.applyIndex!")
 	}
+	// if e.Encode(kv.applyResult) != nil {
+	// 	panic("fail to encode kv.applyResult!")
+	// }
 	if e.Encode(kv.data) != nil {
 		panic("fail to encode kv.data!")
 	}
@@ -287,17 +297,20 @@ func (kv *KVServer) loadSnapshot(snapshot []byte) {
 		r := bytes.NewBuffer(snapshot)
 		d := labgob.NewDecoder(r)
 		var data map[string]string
+		// var applyResult map[int]string
 		var lastRequestId map[int64]int64
 		var applyIndex int
 		if d.Decode(&applyIndex) != nil ||
+			// d.Decode(&applyResult) != nil ||
 			d.Decode(&data) != nil ||
 			d.Decode(&lastRequestId) != nil {
 			DPrintf("[%d] fails to read snapshot!", kv.me)
 			panic("fail to read snapshot")
 		}
 		kv.applyIndex = applyIndex
+		// kv.applyResult = applyResult
 		kv.data = data
 		kv.lastRequestId = lastRequestId
-		DPrintf("[kv %d] successfully load snapshot!", kv.me)
+		DPrintf("[kv %d] load snapshot with applyIndex: %d", kv.me, kv.applyIndex)
 	}
 }
