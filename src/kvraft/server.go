@@ -227,9 +227,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						// duplicate execution
 						DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
 					} else {
+						kv.lock("[kv %d] starts to apply op with index: %d", kv.me, applyMsg.CommandIndex)
 						kv.applyOp(op)
-						// logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d\n", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 						kv.lastRequestId[op.ClerkId] = op.RequestId
+						kv.unlock("[kv %d] finishes applying op with index: %d", kv.me, applyMsg.CommandIndex)
+						// logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d\n", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 					}
 				}
 				kv.applyIndex++
