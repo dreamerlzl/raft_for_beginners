@@ -14,9 +14,9 @@ import (
 )
 
 const Debug = 1
-const checkLeaderPeriod = 100
-const checkSnapshotPeriod = 300
-const ratio float32 = 0.85 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
+const checkLeaderPeriod = 20
+const checkSnapshotPeriod = 150
+const ratio float32 = 0.95 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -102,8 +102,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = ErrWrongLeader
 			return
 		}
-		kv.lock("[kv %d] is reading index %d's result", kv.me, index)
 		if kv.applyIndex >= index {
+			kv.lock("[kv %d] is reading index %d's result", kv.me, index)
 			result := kv.applyResult[index]
 			delete(kv.applyResult, index)
 			kv.unlock("[kv %d] finished reading index %d's result", kv.me, index)
@@ -114,8 +114,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				reply.Value = result
 			}
 			return
-		} else {
-			kv.unlock("[kv %d] finished reading index %d's result", kv.me, index)
 		}
 	}
 
@@ -247,8 +245,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) applyOp(op Op) string {
-	kv.lock("[kv %d] starts to apply %s", kv.me, op2string(op))
-	defer kv.unlock("[kv %d] finishes apply %d", kv.me, op.RequestId)
 	if kv.lastRequestId[op.ClerkId] == op.RequestId {
 		// duplicate execution
 		DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
@@ -280,6 +276,9 @@ func (kv *KVServer) applyOp(op Op) string {
 func (kv *KVServer) encodeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	if e.Encode(kv.applyIndex) != nil {
+		panic("fail to encode kv.applyIndex!")
+	}
 	if e.Encode(kv.data) != nil {
 		panic("fail to encode kv.data!")
 	}
@@ -295,11 +294,14 @@ func (kv *KVServer) loadSnapshot(snapshot []byte) {
 		d := labgob.NewDecoder(r)
 		var data map[string]string
 		var lastRequestId map[int64]int64
-		if d.Decode(&data) != nil ||
+		var applyIndex int
+		if d.Decode(&applyIndex) != nil ||
+			d.Decode(&data) != nil ||
 			d.Decode(&lastRequestId) != nil {
 			DPrintf("[%d] fails to read snapshot!", kv.me)
 			panic("fail to read snapshot")
 		}
+		kv.applyIndex = applyIndex
 		kv.data = data
 		kv.lastRequestId = lastRequestId
 		DPrintf("[kv %d] successfully load snapshot!", kv.me)

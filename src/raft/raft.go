@@ -328,6 +328,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = rf.lastIndex
 		rf.appendLogEntry(LogEntry{Command: command, EntryTerm: term})
 		rf.mu.Unlock()
+		rf.bcastAppendEntries()
 		logrus.Infof("[%d] start to propose entry{command: %v, term: %d} on index %d", rf.me, command, term, rf.lastIndex)
 		rf.persist()
 	} else {
