@@ -15,9 +15,9 @@ func (rf *Raft) TakeSnapshot(snapshot []byte) {
 	if rf.commitIndex > rf.lastIncludedIndex {
 		rf.lock("[%d] starts to take snapshot!", rf.me)
 		// only committed entries will be bundled as a snapshot
-		rf.trimEntries(rf.commitIndex)
+		rf.trimEntries(rf.lastApplied)
 
-		rf.lastIncludedIndex = rf.commitIndex
+		rf.lastIncludedIndex = rf.lastApplied
 		rf.lastIncludedTerm = rf.getLogEntry(rf.lastIncludedIndex).EntryTerm
 
 		// copy the src code here so that no memory reorder will be applied
@@ -105,6 +105,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastIncludedTerm = args.LastIncludeTerm
 		rf.lastIndex = args.LastIncludeIndex
 		rf.commitIndex = args.LastIncludeIndex
+		rf.lastApplied = args.LastIncludeIndex
 		applyMsg := ApplyMsg{
 			CommandValid:      false,
 			Snapshot:          args.Data,

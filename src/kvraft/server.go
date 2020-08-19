@@ -216,13 +216,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 					continue
 				}
 				op := applyMsg.Command.(Op)
-				value := kv.applyOp(op)
-				kv.lock("[kv %d] writes result for index %d", kv.me, applyMsg.CommandIndex)
-				if op.Type == "Get" {
-					kv.applyResult[applyMsg.CommandIndex] = value
+				if kv.lastRequestId[op.ClerkId] == op.RequestId {
+					// duplicate execution
+					DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
+				} else {
+					value := kv.applyOp(op)
+					if op.Type == "Get" {
+						kv.lock("[kv %d] writes result for index %d", kv.me, applyMsg.CommandIndex)
+						kv.applyResult[applyMsg.CommandIndex] = value
+						kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
+					}
+					kv.lastRequestId[op.ClerkId] = op.RequestId
 				}
 				kv.applyIndex++
-				kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
 			} else {
 				// update the data with snapshot
 				kv.applyIndex = applyMsg.LastIncludedIndex
@@ -245,32 +251,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) applyOp(op Op) string {
-	if kv.lastRequestId[op.ClerkId] == op.RequestId {
-		// duplicate execution
-		DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
-		switch op.Type {
-		case "Get":
-			return kv.data[op.Key]
-		default:
+	switch op.Type {
+	case "Get":
+		v, ok := kv.data[op.Key]
+		if ok {
+			return v
+		} else {
 			return ""
 		}
-	} else {
-		kv.lastRequestId[op.ClerkId] = op.RequestId
-		switch op.Type {
-		case "Get":
-			v, ok := kv.data[op.Key]
-			if ok {
-				return v
-			} else {
-				return ""
-			}
-		case "Put":
-			kv.data[op.Key] = op.Value
-		case "Append":
-			kv.data[op.Key] += op.Value
-		}
-		return ""
+	case "Put":
+		kv.data[op.Key] = op.Value
+	case "Append":
+		kv.data[op.Key] += op.Value
 	}
+	return ""
 }
 
 func (kv *KVServer) encodeSnapshot() []byte {

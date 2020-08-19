@@ -405,17 +405,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		for !rf.killed() {
 			time.Sleep(time.Duration(applyPeriod))
-			if rf.commitIndex > rf.lastApplied {
+			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
-				if rf.lastApplied > rf.lastIncludedIndex {
-					applyMsg := ApplyMsg{
-						Command:      rf.getLogEntry(rf.lastApplied).Command,
-						CommandIndex: rf.lastApplied,
-						CommandValid: true,
-					}
-					logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastApplied)
-					rf.applyCh <- applyMsg
+				applyMsg := ApplyMsg{
+					Command:      rf.getLogEntry(rf.lastApplied).Command,
+					CommandIndex: rf.lastApplied,
+					CommandValid: true,
 				}
+				logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastApplied)
+				rf.applyCh <- applyMsg
 			}
 		}
 	}()
