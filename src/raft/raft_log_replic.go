@@ -148,7 +148,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.resetElectionTimer()
 
 	l := len(rf.log)
-	if rf.lastIndex >= args.PrevLogIndex && args.PrevLogIndex-rf.lastIncludedIndex > l {
+	if rf.lastIndex >= args.PrevLogIndex && args.PrevLogIndex-rf.lastIncludedIndex >= l {
 		logrus.Errorf("[%d] lastIncludedIndex: %d, lastIndex: %d, prevIndex: %d\nlog len: %d, %v", rf.me, rf.lastIncludedIndex, rf.lastIndex, args.PrevLogIndex, l, rf.log)
 		panic("index out of range")
 	}
@@ -189,15 +189,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		appendedEntries := args.Entries[MinInt(firstConflictIndex-base, lenAppendEntries):]
 		rf.replaceLogEntries(firstConflictIndex, appendedEntries)
 		rf.persist()
-		if !(firstConflictIndex == myLogLength && myLogLength-base > lenAppendEntries) {
-			rf.lastIndex = args.PrevLogIndex + lenAppendEntries
-			rf.stale = false
-		}
+		// if !(firstConflictIndex == myLogLength && myLogLength-base > lenAppendEntries) {
+		// 	rf.lastIndex = args.PrevLogIndex + lenAppendEntries
+		// 	rf.stale = false
+		// }
 
-		// rf.lastIndex = rf.lastIncludedIndex + len(rf.log) - 1
+		// if rf.lastIndex != rf.lastIncludedIndex+len(rf.log)-1 {
+		// 	panic("inconsistent lastIndex!")
+		// }
+		rf.lastIndex = rf.lastIncludedIndex + len(rf.log) - 1
 
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = MinInt(args.LeaderCommit, firstConflictIndex+len(appendedEntries)-1)
+			// rf.commitIndex = MinInt(args.LeaderCommit, firstConflictIndex+len(appendedEntries)-1)
+			rf.commitIndex = MinInt(args.LeaderCommit, rf.lastIndex)
 			logrus.Debugf("[%d]'s commitIndex: %d", rf.me, rf.commitIndex)
 		}
 		rf.AcceptedLeader = args.LeaderId

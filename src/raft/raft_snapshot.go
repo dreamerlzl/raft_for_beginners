@@ -29,7 +29,7 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastApplied int) {
 		e.Encode(rf.lastIncludedTerm)
 		e.Encode(rf.log)
 		data := w.Bytes()
-		rf.unlock("[%d] finished taking snapshot", rf.me)
+		rf.unlock("[%d] finished taking snapshot with lastIncludedIndex %d", rf.me, rf.lastIncludedIndex)
 		rf.persister.SaveStateAndSnapshot(data, snapshot)
 	}
 }
@@ -85,17 +85,37 @@ func (rf *Raft) sendSnapshot(server int) {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.lock("[%d] starts to install snapshot", rf.me)
+	defer rf.unlock("[%d] finishes installing snapshot", rf.me)
 	reply.Term = rf.currentTerm
 	if args.LeaderTerm < rf.currentTerm {
 		logrus.Debugf("[%d]'s term %d > leader %d's term %d", rf.me, rf.currentTerm, args.LeaderId, args.LeaderTerm)
-		rf.unlock("[%d] finishes installing snapshot", rf.me)
+		return
+	} else if args.LastIncludeIndex <= rf.lastIncludedIndex {
+		logrus.Infof("[%d] (lastIncludedIndex %d) receives a stale snapshot with lastIncludeIndex: %d!", rf.me, rf.lastIncludedIndex, args.LastIncludeIndex)
 		return
 	}
+
+	logrus.Infof("[%d] before installing snapshot: lastIncludedIndex %d, commitIndex %d, lastSent %d, log %d", rf.me, rf.lastIncludedIndex, rf.commitIndex, rf.lastSent, len(rf.log))
 
 	data := rf.encodeRaftState()
 	rf.persister.SaveStateAndSnapshot(data, args.Data)
 
-	if rf.lastSent < args.LastIncludeIndex {
+	sendSS2kv := false
+	if args.LastIncludeIndex <= rf.lastIndex && rf.getLogEntry(args.LastIncludeIndex).EntryTerm == args.LastIncludeTerm {
+		rf.trimEntries(args.LastIncludeIndex)
+		if rf.lastSent < args.LastIncludeIndex {
+			sendSS2kv = true
+			rf.commitIndex = MaxInt(rf.commitIndex, args.LastIncludeIndex)
+		}
+	} else {
+		rf.log = nil
+		rf.appendLogEntry(LogEntry{EntryTerm: args.LastIncludeTerm})
+		rf.commitIndex = args.LastIncludeIndex
+		rf.lastIndex = args.LastIncludeIndex
+		sendSS2kv = true
+	}
+
+	if sendSS2kv {
 		applyMsg := ApplyMsg{
 			CommandValid:      false,
 			Snapshot:          args.Data,
@@ -105,17 +125,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.applyCh <- applyMsg
 		rf.lastSent = args.LastIncludeIndex
 	}
+
 	rf.lastIncludedIndex = args.LastIncludeIndex
 	rf.lastIncludedTerm = args.LastIncludeTerm
-	rf.commitIndex = MaxInt(rf.commitIndex, args.LastIncludeIndex)
 
-	if args.LastIncludeIndex >= rf.lastIncludedIndex && args.LastIncludeIndex <= rf.lastIndex && rf.getLogEntry(args.LastIncludeIndex).EntryTerm == args.LastIncludeTerm {
-		rf.trimEntries(args.LastIncludeIndex)
-		logrus.Infof("[%d] new lastIncludeIndex: %d", rf.me, rf.lastIncludedIndex)
-	} else {
-		rf.log = nil
-		rf.appendLogEntry(LogEntry{EntryTerm: args.LastIncludeTerm})
-		rf.lastIndex = args.LastIncludeIndex
-	}
-	rf.unlock("[%d] finishes installing snapshot", rf.me)
+	logrus.Infof("[%d] new lastIncludeIndex: %d, commitIndex: %d, lastSent: %d, log: %d", rf.me, rf.lastIncludedIndex, rf.commitIndex, rf.lastSent, len(rf.log))
 }
