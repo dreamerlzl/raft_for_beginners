@@ -218,26 +218,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 				op := applyMsg.Command.(Op)
 				DPrintf("[kv %d] receives op with index: %d\nrequest Id: %d\n", kv.me, applyMsg.CommandIndex, op.RequestId)
+				kv.lock("[kv %d] starts to apply op with index: %d", kv.me, applyMsg.CommandIndex)
 				if op.Type == "Get" {
-					kv.lock("[kv %d] writes result for index %d", kv.me, applyMsg.CommandIndex)
 					kv.applyResult[applyMsg.CommandIndex] = kv.applyOp(op)
-					kv.unlock("[kv %d] finished writing result for index %d", kv.me, applyMsg.CommandIndex)
 				} else {
 					if kv.lastRequestId[op.ClerkId] == op.RequestId {
 						// duplicate execution
 						DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
 					} else {
-						kv.lock("[kv %d] starts to apply op with index: %d", kv.me, applyMsg.CommandIndex)
 						kv.applyOp(op)
 						kv.lastRequestId[op.ClerkId] = op.RequestId
-						kv.unlock("[kv %d] finishes applying op with index: %d", kv.me, applyMsg.CommandIndex)
 						// logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d\n", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 					}
 				}
 				kv.applyIndex++
+				kv.unlock("[kv %d] finishes applying op with index: %d", kv.me, applyMsg.CommandIndex)
 			} else {
 				// update the data with snapshot
-				kv.applyIndex = applyMsg.LastIncludedIndex
 				kv.loadSnapshot(applyMsg.Snapshot)
 			}
 		}
@@ -293,6 +290,7 @@ func (kv *KVServer) encodeSnapshot() []byte {
 
 func (kv *KVServer) loadSnapshot(snapshot []byte) {
 	if len(snapshot) > 0 {
+		kv.lock("[kv %d] starts to load snapshot...", kv.me)
 		r := bytes.NewBuffer(snapshot)
 		d := labgob.NewDecoder(r)
 		var data map[string]string
@@ -307,6 +305,6 @@ func (kv *KVServer) loadSnapshot(snapshot []byte) {
 		kv.applyIndex = applyIndex
 		kv.data = data
 		kv.lastRequestId = lastRequestId
-		DPrintf("[kv %d] load snapshot with applyIndex: %d", kv.me, kv.applyIndex)
+		kv.unlock("[kv %d] load snapshot with applyIndex: %d", kv.me, kv.applyIndex)
 	}
 }

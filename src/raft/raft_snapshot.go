@@ -15,6 +15,10 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastApplied int) {
 	if rf.commitIndex > rf.lastIncludedIndex {
 		rf.lock("[%d] starts to take snapshot!", rf.me)
 		// only committed entries will be bundled as a snapshot
+		if lastApplied < rf.lastIncludedIndex {
+			rf.unlock("[%d] installs a snapshot with lastIncludedIndex %d when preparing to take one with %d", rf.me, rf.lastIncludedIndex, lastApplied)
+			return
+		}
 		rf.trimEntries(lastApplied)
 
 		rf.lastIncludedIndex = lastApplied
