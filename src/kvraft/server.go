@@ -16,7 +16,7 @@ import (
 const Debug = 1
 const checkLeaderPeriod = 20
 const checkSnapshotPeriod = 150
-const ratio float32 = 0.95 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
+const ratio float32 = 0.90 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -247,7 +247,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				kv.lock("[kv %d] starts to encode snapshot", kv.me)
 				snapshot := kv.encodeSnapshot()
 				applyIndex := kv.applyIndex
-				kv.unlock("[kv %d] finishes encoding snapshot", kv.me)
+				kv.unlock("[kv %d] finishes encoding snapshot with applyIndex %d", kv.me, applyIndex)
 				kv.rf.TakeSnapshot(snapshot, applyIndex)
 			}
 			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)

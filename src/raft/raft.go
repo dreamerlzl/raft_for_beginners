@@ -31,7 +31,7 @@ import (
 )
 
 var logLevel = logrus.DebugLevel
-var heartbeatPeriod = 20
+var heartbeatPeriod = 50
 var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
 var electTimeoutRange = 250
 var applyPeriod = 2 * heartbeatPeriod
@@ -113,9 +113,9 @@ func (rf *Raft) lock(msg string, f ...interface{}) {
 }
 
 func (rf *Raft) unlock(msg string, f ...interface{}) {
+	logrus.Debugf(msg, f...)
 	rf.mu.Unlock()
 	// logrus.Infof("[%d]"+msg, kv.me)
-	logrus.Debugf(msg, f...)
 }
 
 func (rf *Raft) newElectionTimer() *time.Timer {
