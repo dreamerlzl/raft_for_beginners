@@ -282,9 +282,6 @@ func (kv *KVServer) encodeSnapshot() []byte {
 	if e.Encode(kv.applyIndex) != nil {
 		panic("fail to encode kv.applyIndex!")
 	}
-	// if e.Encode(kv.applyResult) != nil {
-	// 	panic("fail to encode kv.applyResult!")
-	// }
 	if e.Encode(kv.data) != nil {
 		panic("fail to encode kv.data!")
 	}
@@ -299,18 +296,15 @@ func (kv *KVServer) loadSnapshot(snapshot []byte) {
 		r := bytes.NewBuffer(snapshot)
 		d := labgob.NewDecoder(r)
 		var data map[string]string
-		// var applyResult map[int]string
 		var lastRequestId map[int64]int64
 		var applyIndex int
 		if d.Decode(&applyIndex) != nil ||
-			// d.Decode(&applyResult) != nil ||
 			d.Decode(&data) != nil ||
 			d.Decode(&lastRequestId) != nil {
 			DPrintf("[%d] fails to read snapshot!", kv.me)
 			panic("fail to read snapshot")
 		}
 		kv.applyIndex = applyIndex
-		// kv.applyResult = applyResult
 		kv.data = data
 		kv.lastRequestId = lastRequestId
 		DPrintf("[kv %d] load snapshot with applyIndex: %d", kv.me, kv.applyIndex)

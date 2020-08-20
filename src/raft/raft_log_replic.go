@@ -79,7 +79,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs) {
 
 					// logrus.Debugf("[%d] matches %d with follower %d", rf.me, rf.matchIndex[server], server)
 					// logrus.Debugf("[%d] lastIndex: %d", rf.me, rf.lastIndex)
-					logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, lastIndex+1)
+					logrus.Debugf("[%d] new nextIndex[%d]: %d after reply success", rf.me, server, rf.nextIndex[server])
 
 					rf.updateCommitIndex(server)
 				} else {
@@ -102,21 +102,21 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs) {
 					for i := rf.nextIndex[server] - 1; i >= rf.lastIncludedIndex; i-- {
 						if rf.getLogEntry(i).EntryTerm == reply.ConflictTerm {
 							rf.nextIndex[server] = i + 1
-							logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, i+1)
+							logrus.Debugf("[%d] new nextIndex[%d]: %d after fail", rf.me, server, i+1)
 							found = true
 							break
 						}
 					}
 					if !found {
 						rf.nextIndex[server] = reply.ConflictIndex
-						logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, reply.ConflictIndex)
+						logrus.Debugf("[%d] new nextIndex[%d]: %d after fail", rf.me, server, reply.ConflictIndex)
 					}
 				}
 				if rf.nextIndex[server] < rf.lastIncludedIndex || reply.NeedSnapshot {
 					// installSnapshot RPC
 					go rf.sendSnapshot(server)
 				}
-				logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, rf.nextIndex[server])
+				// logrus.Debugf("[%d] new nextIndex[%d]: %d after reply fail", rf.me, server, rf.nextIndex[server])
 			}
 			rf.mu.Unlock()
 		} else {
@@ -135,9 +135,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		logrus.Debugf("[%d]'s term %d > leader %d's term %d", rf.me, rf.currentTerm, args.LeaderId, args.SenderTerm)
 		return
 	}
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// a stale appendEntry
+		reply.Success = true
+		logrus.Infof("[%d] receives a stale appendEntry:\n", rf.me)
+		logrus.Infof("commitId: %d  lastIncludedIndex: %d leader %d commit: %d prevLogIndex: %d", rf.commitIndex, rf.lastIncludedIndex, args.LeaderId, args.LeaderCommit, args.PrevLogIndex)
+		// panic("unexpected situation")
+		return
+	}
 
 	rf.electionTimer.Stop()
 	defer rf.resetElectionTimer()
+
+	l := len(rf.log)
+	if rf.lastIndex >= args.PrevLogIndex && args.PrevLogIndex-rf.lastIncludedIndex > l {
+		logrus.Errorf("[%d] lastIncludedIndex: %d, lastIndex: %d, prevIndex: %d\nlog len: %d, %v", rf.me, rf.lastIncludedIndex, rf.lastIndex, args.PrevLogIndex, l, rf.log)
+		panic("index out of range")
+	}
+
 	if rf.lastIndex < args.PrevLogIndex {
 		logrus.Debugf("[%d] log inconsistent with leader %d; lastIndex: %d, PrevLogIndex: %d", rf.me, args.LeaderId, rf.lastIndex, args.PrevLogIndex)
 		reply.ConflictIndex = rf.lastIndex + 1
@@ -170,15 +185,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
-		rf.replaceLogEntries(firstConflictIndex, args.Entries[MinInt(firstConflictIndex-base, lenAppendEntries):])
+
+		appendedEntries := args.Entries[MinInt(firstConflictIndex-base, lenAppendEntries):]
+		rf.replaceLogEntries(firstConflictIndex, appendedEntries)
 		rf.persist()
 		if !(firstConflictIndex == myLogLength && myLogLength-base > lenAppendEntries) {
 			rf.lastIndex = args.PrevLogIndex + lenAppendEntries
 			rf.stale = false
 		}
 
+		// rf.lastIndex = rf.lastIncludedIndex + len(rf.log) - 1
+
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = MinInt(args.LeaderCommit, firstConflictIndex+len(args.Entries)-1)
+			rf.commitIndex = MinInt(args.LeaderCommit, firstConflictIndex+len(appendedEntries)-1)
 			logrus.Debugf("[%d]'s commitIndex: %d", rf.me, rf.commitIndex)
 		}
 		rf.AcceptedLeader = args.LeaderId
@@ -186,9 +205,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			logrus.Debugf("[%d] receives heartbeat with term %d from leader %d",
 				rf.me, args.SenderTerm, args.LeaderId)
 		} else {
-			startIndex := MinInt(firstConflictIndex-base, lenAppendEntries)
+			// startIndex := MinInt(firstConflictIndex-base, lenAppendEntries)
+			startIndex := firstConflictIndex
+			if firstConflictIndex >= base+lenAppendEntries {
+				startIndex = base
+			}
 			logrus.Debugf("[%d] receives appendEntries starting %d ending %d with term %d from leader %d",
-				rf.me, startIndex+base, lenAppendEntries+base, args.SenderTerm, args.LeaderId)
+				rf.me, startIndex, lenAppendEntries+base, args.SenderTerm, args.LeaderId)
 		}
 
 	}
