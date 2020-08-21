@@ -11,6 +11,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	logrus "github.com/sirupsen/logrus"
 )
 
 const Debug = 1
@@ -226,9 +227,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						// duplicate execution
 						DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
 					} else {
+						logrus.Debugf("[kv %d] keyL %v value: %v before applying index:%d", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 						kv.applyOp(op)
 						kv.lastRequestId[op.ClerkId] = op.RequestId
-						// logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d\n", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
+						logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 					}
 				}
 				kv.applyIndex++
@@ -269,6 +271,8 @@ func (kv *KVServer) applyOp(op Op) string {
 		kv.data[op.Key] = op.Value
 	case "Append":
 		kv.data[op.Key] += op.Value
+	default:
+		panic("unknown op type!")
 	}
 	return ""
 }
