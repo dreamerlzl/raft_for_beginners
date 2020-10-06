@@ -33,8 +33,8 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastApplied int) {
 		e.Encode(rf.lastIncludedTerm)
 		e.Encode(rf.log)
 		data := w.Bytes()
-		rf.unlock("[%d] finished taking snapshot with lastIncludedIndex %d", rf.me, rf.lastIncludedIndex)
 		rf.persister.SaveStateAndSnapshot(data, snapshot)
+		rf.unlock("[%d] finished taking snapshot with lastIncludedIndex %d", rf.me, rf.lastIncludedIndex)
 	}
 }
 

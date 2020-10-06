@@ -31,7 +31,7 @@ import (
 )
 
 var logLevel = logrus.DebugLevel
-var heartbeatPeriod = 50
+var heartbeatPeriod = 20
 var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
 var electTimeoutRange = 250
 var applyPeriod = 2 * heartbeatPeriod
@@ -327,10 +327,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.lastIndex++
 		index = rf.lastIndex
 		rf.appendLogEntry(LogEntry{Command: command, EntryTerm: term})
-		rf.mu.Unlock()
-		// rf.bcastAppendEntries()
 		logrus.Infof("[%d] start to propose entry{command: %v, term: %d} on index %d", rf.me, command, term, index)
 		rf.persist()
+		rf.mu.Unlock()
+		// rf.bcastAppendEntries()
 	} else {
 		rf.mu.Unlock()
 	}

@@ -136,8 +136,8 @@ func (rf *Raft) becomeCandidate() {
 		args.LastLogIndex = rf.lastIndex
 		args.LastLogTerm = rf.getLogEntry(rf.lastIndex).EntryTerm
 		numPeers := len(rf.peers)
-		rf.mu.Unlock()
 		rf.persist()
+		rf.mu.Unlock()
 
 		finish := false
 		vote := 1 // note that it vote for itself
