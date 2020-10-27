@@ -1,5 +1,9 @@
 package shardmaster
 
+import (
+	"log"
+)
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -20,6 +24,73 @@ package shardmaster
 // The number of shards.
 const NShards = 10
 
+func DPrintf(format string, a ...interface{}) {
+	if debug == 1 {
+		log.Printf(format, a...)
+	}
+}
+
+func Min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func Max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func equalShards(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := make(map[int]bool)
+	for _, v := range a {
+		as[v] = true
+	}
+
+	bs := make(map[int]bool)
+	for _, v := range b {
+		bs[v] = true
+	}
+
+	for k, _ := range as {
+		_, ok := bs[k]
+		if !ok {
+			return false
+		}
+		delete(bs, k)
+	}
+
+	for k, _ := range bs {
+		_, ok := as[k]
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func deleteShard(shards []int, shard int) []int {
+	index := -1
+	for i, v := range shards {
+		if v == shard {
+			index = i
+		}
+	}
+	if index == -1 {
+		return shards
+	}
+	l := len(shards)
+	shards[l-1], shards[index] = shards[index], shards[l-1]
+	shards = shards[:l-1]
+	return shards
+}
+
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
 type Config struct {
@@ -35,7 +106,9 @@ const (
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers   map[int][]string // new GID -> servers mappings
+	ClerkId   int64
+	RequestId int64
 }
 
 type JoinReply struct {
@@ -44,7 +117,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs      []int
+	ClerkId   int64
+	RequestId int64
 }
 
 type LeaveReply struct {
@@ -53,8 +128,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard     int
+	GID       int
+	ClerkId   int64
+	RequestId int64
 }
 
 type MoveReply struct {
@@ -63,7 +140,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num       int // desired config number
+	ClerkId   int64
+	RequestId int64
 }
 
 type QueryReply struct {
