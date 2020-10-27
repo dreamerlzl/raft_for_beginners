@@ -31,17 +31,17 @@ type ShardMaster struct {
 }
 
 func (sm *ShardMaster) DPrintf(msg string, f ...interface{}) {
-	DPrintf("[sm"+string(sm.me)+"]"+msg, f...)
+	DPrintf(fmt.Sprintf("[sm %d] %s", sm.me, msg), f...)
 }
 
 func (sm *ShardMaster) lock(msg string, f ...interface{}) {
 	sm.mu.Lock()
-	DPrintf(msg, f...)
+	sm.DPrintf(msg, f...)
 }
 
 func (sm *ShardMaster) unlock(msg string, f ...interface{}) {
 	sm.mu.Unlock()
-	DPrintf(msg, f...)
+	sm.DPrintf(msg, f...)
 }
 
 type RequestType int
@@ -82,11 +82,11 @@ func op2string(op Op) string {
 
 func (sm *ShardMaster) isDuplicate(clerkId, requestId int64) bool {
 	duplicate := false
-	sm.lock("[sm %d] checks whether the request %d by %d is duplicate", sm.me, requestId, clerkId)
+	sm.lock("checks whether the request %d by %d is duplicate", requestId, clerkId)
 	if sm.lastRequestId[clerkId] == requestId {
 		duplicate = true
 	}
-	sm.unlock("[sm %d] finished check duplication", sm.me)
+	sm.unlock("finished check duplication")
 	return duplicate
 }
 
@@ -110,7 +110,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		return
 	}
 
-	DPrintf("[sm %d] issues %s at index %d", sm.me, op2string(op), index)
+	sm.DPrintf("issues %s at index %d", op2string(op), index)
 
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
@@ -147,7 +147,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 		return
 	}
 
-	DPrintf("[sm %d] issues %s at index %d", sm.me, op2string(op), index)
+	sm.DPrintf("issues %s at index %d", op2string(op), index)
 
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
@@ -185,7 +185,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		return
 	}
 
-	DPrintf("[sm %d] issues %s at index %d", sm.me, op2string(op), index)
+	sm.DPrintf("issues %s at index %d", op2string(op), index)
 
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
@@ -222,7 +222,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		return
 	}
 
-	DPrintf("[sm %d] issues %s at index %d", sm.me, op2string(op), index)
+	sm.DPrintf("issues %s at index %d", op2string(op), index)
 
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
@@ -232,7 +232,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 			return
 		}
 		if sm.applyIndex >= index {
-			sm.lock("[sm %d] is reading config %d", sm.me, args.Num)
+			sm.lock("is reading config %d", args.Num)
 			if args.Num < len(sm.configs) && args.Num > 0 {
 				reply.Config = sm.configs[args.Num]
 			} else if args.Num == -1 {
@@ -241,7 +241,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 				reply.Config = Config{}
 				reply.Err = "Invalid configuration number"
 			}
-			sm.unlock("[sm %d] finished reading config %d", sm.me, args.Num)
+			sm.unlock("finished reading config %d", args.Num)
 			reply.Err = OK
 			reply.WrongLeader = false
 			return
@@ -254,19 +254,19 @@ func (sm *ShardMaster) checkApplyMsg() {
 		applyMsg := <-sm.applyCh
 		if applyMsg.CommandValid {
 			if sm.applyIndex+1 != applyMsg.CommandIndex {
-				DPrintf("[sm %d] application not in order! expected: %d, given: %d", sm.me, sm.applyIndex+1, applyMsg.CommandIndex)
+				sm.DPrintf("application not in order! expected: %d, given: %d", sm.applyIndex+1, applyMsg.CommandIndex)
 				panic("application not in order")
 			}
 			op := applyMsg.Command.(Op)
-			sm.lock("[sm %d] starts to apply op %s", sm.me, op2string(op))
+			sm.lock("starts to apply op %s", op2string(op))
 			if sm.lastRequestId[op.ClerkId] == op.RequestId {
-				DPrintf("[sm %d] duplicate request %d by %d", sm.me, op.RequestId, op.ClerkId)
+				sm.DPrintf("duplicate request %d by %d", op.RequestId, op.ClerkId)
 			} else {
 				sm.applyOp(op)
 				sm.lastRequestId[op.ClerkId] = op.RequestId
 				sm.applyIndex++
 			}
-			sm.unlock("[sm %d] ends applying op %s", sm.me, op2string(op))
+			sm.unlock("ends applying op %s", op2string(op))
 		} else {
 			// reserved for snapshots!
 		}
@@ -307,20 +307,20 @@ func (sm *ShardMaster) applyOp(op Op) {
 
 	for gid, shards := range gid2shards {
 		if !equalShards(shards, sm.gid2shards[gid]) {
-			DPrintf("[sm %d] inconsistent shards %v and gid2shards %v", sm.me, c.Shards, sm.gid2shards)
+			sm.DPrintf("inconsistent shards %v and gid2shards %v", c.Shards, sm.gid2shards)
 			panic("inconsistent shards and gid2shards")
 		}
 	}
 
 	switch op.Type {
 	case join:
-		DPrintf("[sm %d] before join %v; %v, %v, %v", sm.me, op.Servers, len(c.Groups), sm.gid2shards, c.Shards)
+		sm.DPrintf("before join %v; %v, %v, %v", op.Servers, len(c.Groups), sm.gid2shards, c.Shards)
 		c = sm.rebalanceJoin(c, op.Servers) // in-place modification
-		DPrintf("[sm %d] after join %v; %v, %v,%v", sm.me, op.Servers, len(c.Groups), sm.gid2shards, c.Shards)
+		sm.DPrintf("after join %v; %v, %v,%v", op.Servers, len(c.Groups), sm.gid2shards, c.Shards)
 	case leave:
-		DPrintf("[sm %d] before leave %v: %v, %v, %v", sm.me, op.GIDs, len(c.Groups), sm.gid2shards, c.Shards)
+		sm.DPrintf("before leave %v: %v, %v, %v", op.GIDs, len(c.Groups), sm.gid2shards, c.Shards)
 		c = sm.rebalanceLeave(c, op.GIDs) // in-place modification
-		DPrintf("[sm %d] after leave %v: %v, %v, %v", sm.me, op.GIDs, len(c.Groups), sm.gid2shards, c.Shards)
+		sm.DPrintf("after leave %v: %v, %v, %v", op.GIDs, len(c.Groups), sm.gid2shards, c.Shards)
 	case move:
 		oldGid := c.Shards[op.Shard]
 		sm.gid2shards[oldGid] = deleteShard(sm.gid2shards[oldGid], op.Shard)
@@ -385,7 +385,7 @@ func (sm *ShardMaster) rebalanceLeave(c Config, gids []int) Config {
 	pool := make([]int, 0, NShards-newSize*NShards/oldSize)
 	for _, gid := range gids {
 		pool = append(pool, sm.gid2shards[gid]...)
-		sm.DPrintf("add %v from %d to pool", sm.gid2shards[gid], gid)
+		// sm.DPrintf("add %v from %d to pool", sm.gid2shards[gid], gid)
 		delete(sm.gid2shards, gid)
 		delete(c.Groups, gid)
 	}
@@ -403,7 +403,7 @@ func (sm *ShardMaster) rebalanceLeave(c Config, gids []int) Config {
 			gid := pair.Key
 			thisTake = ps / l
 			sm.gid2shards[gid] = append(sm.gid2shards[gid], pool[:thisTake]...)
-			sm.DPrintf("%d takes %v from pool", gid, pool[:thisTake])
+			// sm.DPrintf("%d takes %v from pool", gid, pool[:thisTake])
 			for _, shard := range pool[:thisTake] {
 				c.Shards[shard] = gid
 			}
