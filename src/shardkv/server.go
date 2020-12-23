@@ -16,9 +16,13 @@ import (
 )
 
 const Debug = true
-const checkLeaderPeriod = 20
-const rpcTimeout = 100
+const (
+	checkLeaderPeriod   = 20
+	checkSnapshotPeriod = 150
+	rpcTimeout          = 100
+)
 const logLevel = logrus.DebugLevel
+const ratio float32 = 0.90 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
 
 type Op struct {
 	// Your definitions here.
@@ -31,8 +35,9 @@ type Op struct {
 	ClerkId   int64
 
 	// for loadShard
-	Shard    map[string]string
-	ShardNum int
+	Shard     map[string]string
+	ShardNum  int
+	ConfigVer int
 
 	// for sendShard
 	Config shardmaster.Config
@@ -80,6 +85,7 @@ type ShardKV struct {
 	lastRequestId map[int64]int64           // ClerkId -> last finished RequestId
 	applyResult   map[int]interface{}
 	applyIndex    int
+	shardVersion  map[int]int
 }
 
 func (kv *ShardKV) DPrintf(msg string, f ...interface{}) {
@@ -133,6 +139,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			case Err:
 				reply.Err = result.(Err) // ErrNoKey or ErrWrongGroup
 				kv.DPrintf("%v <- %s", reply.Err, op2string(op))
+				if reply.Err == ErrWrongGroup {
+					kv.DPrintf("owns shard %v", mapKeys(kv.data))
+				}
 			case string:
 				reply.Err = OK
 				reply.Value = result.(string)
@@ -179,7 +188,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				panic("unexpected string!\n")
 			default:
 				reply.Err = result.(Err)
-				kv.DPrintf("result of %s: %s", op2string(op), reply.Err)
+				kv.DPrintf("result of %d %s: %s", index, op2string(op), reply.Err)
+				if reply.Err == ErrWrongGroup {
+					kv.DPrintf("owns shard %v", mapKeys(kv.data))
+				}
 			}
 			return
 		}
@@ -255,11 +267,28 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastRequestId = make(map[int64]int64)
 	kv.applyIndex = 0 // as raft, 1 is the first meaingful index
 	kv.applyResult = make(map[int]interface{})
+	kv.shardVersion = make(map[int]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	// read snapshot
+	kv.loadSnapshot(kv.rf.GetSnapshot())
+
 	go kv.checkApply()
 	go kv.pollConfig()
+	// periodically check whether need to take a snapshot
+	go func() {
+		for {
+			if kv.rf.GetStateSize() >= int(ratio*float32(kv.maxraftstate)) {
+				kv.lock("starts to encode snapshot")
+				snapshot := kv.encodeSnapshot()
+				applyIndex := kv.applyIndex
+				kv.unlock("finishes encoding snapshot with applyIndex %d", applyIndex)
+				kv.rf.TakeSnapshot(snapshot, applyIndex)
+			}
+			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)
+		}
+	}()
 
 	return kv
 }
@@ -279,7 +308,7 @@ func (kv *ShardKV) checkApply() {
 			} else {
 				if op.RequestId > -1 && kv.lastRequestId[op.ClerkId] == op.RequestId {
 					// duplicate execution
-					kv.DPrintf("detects duplicate request %d", op.RequestId)
+					kv.DPrintf("detects duplicate request %d for index %d", op.RequestId, applyMsg.CommandIndex)
 					kv.applyResult[applyMsg.CommandIndex] = ErrDuplicate
 				} else {
 					kv.applyResult[applyMsg.CommandIndex] = kv.applyOp(op)
@@ -302,7 +331,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 	shard := key2shard(op.Key)
 	hasShard := true
 	_, ok := kv.data[shard]
-	if kv.data[shard] == nil || !ok {
+	if !ok {
 		hasShard = false
 	}
 	kv.DPrintf("starts to apply op %s", op2string(op))
@@ -331,10 +360,11 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 	case "SendShard":
 		kv.sendShard(op)
 	case "LoadShard":
-		kv.loadShard(op.ShardNum, op.Shard)
+		kv.loadShard(op)
 	case "Init":
 		for _, shardNum := range op.Shards {
 			kv.data[shardNum] = make(map[string]string)
+			kv.shardVersion[shardNum] = op.Num
 		}
 		kv.lastConfigVer = op.Num
 		kv.DPrintf("finish init")
@@ -404,16 +434,17 @@ func (kv *ShardKV) sendShard(op Op) {
 	if op.ClerkId == int64(kv.me) {
 		numShards := len(config.Shards)
 		for i := 0; i < numShards; i++ {
-			if kv.data[i] != nil && config.Shards[i] != kv.gid {
+			if _, ok := kv.data[i]; ok && config.Shards[i] != kv.gid {
 				// me would need to send this shard to group with gid config.Shards[i]
 				destGid := config.Shards[i]
 
 				kv.DPrintf("starts to send shard %d", i)
 				args := GetShardArgs{
-					ShardNum: i,
-					Shard:    shardCopy(kv.data[i]),
+					ConfigVer: config.Num,
+					ShardNum:  i,
+					Shard:     shardCopy(kv.data[i]),
 				}
-				kv.data[i] = nil
+				delete(kv.data, i)
 
 				if servers, ok := config.Groups[destGid]; ok {
 					for si := 0; si < len(servers); si++ {
@@ -430,8 +461,8 @@ func (kv *ShardKV) sendShard(op Op) {
 	} else {
 		numShards := len(config.Shards)
 		for i := 0; i < numShards; i++ {
-			if kv.data[i] != nil && config.Shards[i] != kv.gid {
-				kv.data[i] = nil
+			if _, ok := kv.data[i]; ok && config.Shards[i] != kv.gid {
+				delete(kv.data, i)
 			}
 		}
 	}
@@ -439,9 +470,14 @@ func (kv *ShardKV) sendShard(op Op) {
 }
 
 // TODO;
-func (kv *ShardKV) loadShard(shardNum int, shard map[string]string) {
-	kv.data[shardNum] = shard
-	kv.DPrintf("receives shard %d, %v", shardNum, shard)
+func (kv *ShardKV) loadShard(op Op) {
+	if _, ok := kv.shardVersion[op.ShardNum]; !ok || op.ConfigVer > kv.shardVersion[op.ShardNum] {
+		kv.data[op.ShardNum] = op.Shard
+		kv.shardVersion[op.ShardNum] = op.ConfigVer
+		kv.DPrintf("receives shard %d, %v of version %d", op.ShardNum, op.Shard, op.ConfigVer)
+	} else {
+		kv.DPrintf("receives stale shard %d of version %d", op.ShardNum, op.ConfigVer)
+	}
 }
 
 //TODO; rpc for get a shard from another replica group
@@ -451,6 +487,7 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 		Type:      "LoadShard",
 		ShardNum:  args.ShardNum,
 		Shard:     args.Shard,
+		ConfigVer: args.ConfigVer,
 		ClerkId:   -1,
 		RequestId: -1,
 	}
@@ -476,6 +513,27 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 	}
 }
 
+func (kv *ShardKV) encodeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.applyIndex) != nil {
+		panic("fail to encode kv.applyIndex!")
+	}
+	if e.Encode(kv.lastConfigVer) != nil {
+		panic("fail to encode kv.lastConfigVer!")
+	}
+	if e.Encode(kv.data) != nil {
+		panic("fail to encode kv.data!")
+	}
+	if e.Encode(kv.lastRequestId) != nil {
+		panic("fail to encode kv.lastRequestId!")
+	}
+	if e.Encode(kv.shardVersion) != nil {
+		panic("fail to encode kv.shardVersion!")
+	}
+	return w.Bytes()
+}
+
 //TODO; add fields
 func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 	if len(snapshot) > 0 {
@@ -484,16 +542,23 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		d := labgob.NewDecoder(r)
 		var data map[int]map[string]string
 		var lastRequestId map[int64]int64
+		var shardVersion map[int]int
 		var applyIndex int
+		var lastConfigVer int
 		if d.Decode(&applyIndex) != nil ||
+			d.Decode(&lastConfigVer) != nil ||
 			d.Decode(&data) != nil ||
-			d.Decode(&lastRequestId) != nil {
+			d.Decode(&lastRequestId) != nil ||
+			d.Decode(&shardVersion) != nil {
 			kv.DPrintf("fails to read snapshot!")
 			panic("fail to read snapshot")
 		}
 		kv.applyIndex = applyIndex
 		kv.data = data
 		kv.lastRequestId = lastRequestId
+		kv.lastConfigVer = lastConfigVer
+		kv.shardVersion = shardVersion
+		kv.DPrintf("loads applyIndex %d, data: %v", kv.applyIndex, kv.data)
 		kv.unlock("load snapshot with applyIndex: %d", kv.applyIndex)
 	}
 }
