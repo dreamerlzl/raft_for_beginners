@@ -277,7 +277,7 @@ func (kv *ShardKV) checkApply() {
 			if op.Type == "Get" {
 				kv.applyResult[applyMsg.CommandIndex] = kv.applyOp(op)
 			} else {
-				if op.ClerkId > -1 && kv.lastRequestId[op.ClerkId] == op.RequestId {
+				if op.RequestId > -1 && kv.lastRequestId[op.ClerkId] == op.RequestId {
 					// duplicate execution
 					kv.DPrintf("detects duplicate request %d", op.RequestId)
 					kv.applyResult[applyMsg.CommandIndex] = ErrDuplicate
@@ -300,7 +300,11 @@ func (kv *ShardKV) checkApply() {
 func (kv *ShardKV) applyOp(op Op) interface{} {
 	// any string/OK (Err) for success, others for failure
 	shard := key2shard(op.Key)
-	_, hasShard := kv.data[shard]
+	hasShard := true
+	_, ok := kv.data[shard]
+	if kv.data[shard] == nil || !ok {
+		hasShard = false
+	}
 	kv.DPrintf("starts to apply op %s", op2string(op))
 	defer kv.DPrintf("finish applying op %s", op2string(op))
 	switch op.Type {
