@@ -55,7 +55,7 @@ func op2string(op Op) (r string) {
 	case "Init":
 		r = fmt.Sprintf("init shards %v", op.Shards)
 	case "SendShard":
-		r = fmt.Sprintf("update config to %d", op.Config.Num)
+		r = fmt.Sprintf("update config to %d: %v", op.Config.Num, op.Config.Shards)
 	default:
 		fmt.Printf("%v:", op.Type)
 		panic("unexpected type!")
@@ -128,13 +128,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			kv.lock("is reading index %d's result", index)
 			result := kv.applyResult[index]
 			delete(kv.applyResult, index)
-			kv.unlock("finished reading index %d's result", index)
+			kv.unlock("finished reading index %d's result %v", index, result)
 			switch result.(type) {
 			case Err:
 				reply.Err = result.(Err) // ErrNoKey or ErrWrongGroup
+				kv.DPrintf("%v <- %s", reply.Err, op2string(op))
 			case string:
 				reply.Err = OK
 				reply.Value = result.(string)
+				kv.DPrintf("%v <- %s", reply.Value, op2string(op))
 			}
 			return
 		}
@@ -384,7 +386,7 @@ func (kv *ShardKV) pollConfig() {
 					Type:      "SendShard",
 					Config:    config,
 					RequestId: -1,
-					ClerkId:   -1,
+					ClerkId:   int64(kv.me),
 				}
 				kv.rf.Start(op)
 			}
@@ -393,12 +395,9 @@ func (kv *ShardKV) pollConfig() {
 }
 
 func (kv *ShardKV) sendShard(op Op) {
-	kv.DPrintf("before getting state")
-	_, isLeader := kv.rf.GetState()
-	kv.DPrintf("after getting state")
 	config := op.Config
 	// kv.DPrintf("start to update config %d", config.Num)
-	if isLeader {
+	if op.ClerkId == int64(kv.me) {
 		numShards := len(config.Shards)
 		for i := 0; i < numShards; i++ {
 			if kv.data[i] != nil && config.Shards[i] != kv.gid {
@@ -424,6 +423,13 @@ func (kv *ShardKV) sendShard(op Op) {
 				}
 			}
 		}
+	} else {
+		numShards := len(config.Shards)
+		for i := 0; i < numShards; i++ {
+			if kv.data[i] != nil && config.Shards[i] != kv.gid {
+				kv.data[i] = nil
+			}
+		}
 	}
 	kv.lastConfigVer = config.Num
 }
@@ -431,6 +437,7 @@ func (kv *ShardKV) sendShard(op Op) {
 // TODO;
 func (kv *ShardKV) loadShard(shardNum int, shard map[string]string) {
 	kv.data[shardNum] = shard
+	kv.DPrintf("receives shard %d, %v", shardNum, shard)
 }
 
 //TODO; rpc for get a shard from another replica group
