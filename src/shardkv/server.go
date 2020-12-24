@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
@@ -88,6 +89,13 @@ type ShardKV struct {
 	shardVersion  map[int]int
 }
 
+type logWriter struct {
+}
+
+func (writer logWriter) Write(bytes []byte) (int, error) {
+	return fmt.Print(time.Now().UTC().Format("15:04:05.999") + string(bytes))
+}
+
 func (kv *ShardKV) DPrintf(msg string, f ...interface{}) {
 	if Debug {
 		log.Printf("[gid %d, kv %d] %s", kv.gid, kv.me, fmt.Sprintf(msg, f...))
@@ -140,7 +148,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 				reply.Err = result.(Err) // ErrNoKey or ErrWrongGroup
 				kv.DPrintf("%v <- %s", reply.Err, op2string(op))
 				if reply.Err == ErrWrongGroup {
-					kv.DPrintf("owns shard %v", mapKeys(kv.data))
+					vers := make([]int, len(kv.data))
+					keys := make([]int, len(kv.data))
+					i := 0
+					for k := range kv.data {
+						keys[i] = k
+						vers[i] = kv.shardVersion[k]
+						i++
+					}
+					kv.DPrintf("owns shard %v with config %d, %v", keys, kv.lastConfigVer, vers)
 				}
 			case string:
 				reply.Err = OK
@@ -190,7 +206,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				reply.Err = result.(Err)
 				kv.DPrintf("result of %d %s: %s", index, op2string(op), reply.Err)
 				if reply.Err == ErrWrongGroup {
-					kv.DPrintf("owns shard %v", mapKeys(kv.data))
+					vers := make([]int, len(kv.data))
+					keys := make([]int, len(kv.data))
+					i := 0
+					for k := range kv.data {
+						keys[i] = k
+						vers[i] = kv.shardVersion[k]
+						i++
+					}
+					kv.DPrintf("owns shard %v with config %d, %v", keys, kv.lastConfigVer, vers)
 				}
 			}
 			return
@@ -254,11 +278,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
-	logrus.SetLevel(logLevel)
-	logrus.SetFormatter(&logrus.TextFormatter{
-		TimestampFormat: time.StampMilli,
-		FullTimestamp:   true,
-	})
+	log.SetFlags(0)
+	log.SetOutput(new(logWriter))
 
 	kv.lastConfigVer = 0
 	kv.sm_ck = shardmaster.MakeClerk(masters)
@@ -430,6 +451,7 @@ func (kv *ShardKV) pollConfig() {
 
 func (kv *ShardKV) sendShard(op Op) {
 	config := op.Config
+
 	// kv.DPrintf("start to update config %d", config.Num)
 	if op.ClerkId == int64(kv.me) {
 		numShards := len(config.Shards)
@@ -438,7 +460,7 @@ func (kv *ShardKV) sendShard(op Op) {
 				// me would need to send this shard to group with gid config.Shards[i]
 				destGid := config.Shards[i]
 
-				kv.DPrintf("starts to send shard %d", i)
+				kv.DPrintf("starts to send shard %d to %d for config %d", i, config.Shards[i], config.Num)
 				args := GetShardArgs{
 					ConfigVer: config.Num,
 					ShardNum:  i,
@@ -447,14 +469,35 @@ func (kv *ShardKV) sendShard(op Op) {
 				delete(kv.data, i)
 
 				if servers, ok := config.Groups[destGid]; ok {
-					for si := 0; si < len(servers); si++ {
-						srv := kv.make_end(servers[si])
-						var reply GetShardReply
-						ok := srv.Call("ShardKV.GetShard", &args, &reply)
-						if ok && reply.Err == OK {
+					finish := false
+					for j := 0; j < 10; j++ {
+						for si := 0; si < len(servers); si++ {
+							srv := kv.make_end(servers[si])
+							var reply GetShardReply
+							ok := srv.Call("ShardKV.GetShard", &args, &reply)
+							if ok {
+								if reply.Err == OK {
+									kv.DPrintf("finishes sending shard %d to %d for config %d", i, config.Shards[i], config.Num)
+									finish = true
+									break
+								} else {
+									kv.DPrintf("[gid %d, kv %d] %v <- failed to accept shard %d for config %d", config.Shards[i], si, reply.Err, i, config.Num)
+								}
+							}
+						}
+						if finish {
 							break
 						}
+						time.Sleep(100 * time.Millisecond)
+						kv.DPrintf("retry sending shard %d to %d for config %d", i, config.Shards[i], config.Num)
 					}
+					if finish {
+						continue
+					}
+					kv.DPrintf("failed to send shard %d to %d for config %d", i, config.Shards[i], config.Num)
+					panic("failed after retry limits")
+				} else {
+					panic("wrong dest group " + strconv.Itoa(destGid))
 				}
 			}
 		}
@@ -491,12 +534,14 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 		ClerkId:   -1,
 		RequestId: -1,
 	}
-	index, term, isLeader := kv.rf.Start(op)
+	_, term, isLeader := kv.rf.Start(op)
+	reply.Err = OK
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
+	kv.DPrintf("starts to receives shard %d for config %d", args.ShardNum, args.ConfigVer)
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
 		// periodically check the currentTerm and apply result
@@ -506,10 +551,10 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 			reply.Err = ErrWrongLeader
 			return
 		}
-		if kv.applyIndex >= index {
-			reply.Err = OK
-			return
-		}
+		// if kv.applyIndex >= index {
+		// 	kv.DPrintf("prepares to receives shard %d for config %d", args.ShardNum, args.ConfigVer)
+		// 	return
+		// }
 	}
 }
 
