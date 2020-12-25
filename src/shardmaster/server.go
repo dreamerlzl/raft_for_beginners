@@ -12,7 +12,7 @@ import (
 	"../raft"
 )
 
-const debug = 0
+const debug = 1
 const (
 	checkLeaderPeriod   = 50
 	checkSnapshotPeriod = 150
@@ -33,6 +33,7 @@ type ShardMaster struct {
 	lastRequestId map[int64]int64 // clerk id -> last finished request id
 	applyIndex    int
 	gid2shards    map[int][]int // configs[-1]'s mappings of gid -> shards
+	applyResult   map[int]interface{}
 }
 
 func (sm *ShardMaster) DPrintf(msg string, f ...interface{}) {
@@ -85,15 +86,15 @@ func op2string(op Op) string {
 	return s
 }
 
-func (sm *ShardMaster) isDuplicate(clerkId, requestId int64) bool {
-	duplicate := false
-	sm.lock("checks whether the request %d by %d is duplicate", requestId, clerkId)
-	if sm.lastRequestId[clerkId] == requestId {
-		duplicate = true
-	}
-	sm.unlock("finished check duplication")
-	return duplicate
-}
+// func (sm *ShardMaster) isDuplicate(clerkId, requestId int64) bool {
+// 	duplicate := false
+// 	sm.lock("checks whether the request %d by %d is duplicate", requestId, clerkId)
+// 	if sm.lastRequestId[clerkId] == requestId {
+// 		duplicate = true
+// 	}
+// 	sm.unlock("finished check duplication")
+// 	return duplicate
+// }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
@@ -109,8 +110,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		Servers:   args.Servers,
 	}
 	index, term, isLeader := sm.rf.Start(op)
-	reply.WrongLeader = true
-	reply.Err = "wrong shardmaster leader; try another!\n"
+	reply.Err = WrongLeader
 	if isLeader == false {
 		return
 	}
@@ -126,7 +126,6 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		}
 		if sm.applyIndex >= index {
 			reply.Err = OK
-			reply.WrongLeader = false
 			return
 		}
 	}
@@ -145,9 +144,8 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 		ClerkId:   args.ClerkId,
 		GIDs:      args.GIDs,
 	}
-	index, term, isLeader := sm.rf.Start(op)
-	reply.WrongLeader = true
-	reply.Err = "wrong shardmaster leader; try another!\n"
+	index, _, isLeader := sm.rf.Start(op)
+	reply.Err = WrongLeader
 	if isLeader == false {
 		return
 	}
@@ -157,13 +155,12 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
 		time.Sleep(period)
-		currentTerm, isleader := sm.rf.GetState()
-		if !(term == currentTerm && isleader) {
-			return
-		}
+		// currentTerm, isleader := sm.rf.GetState()
+		// if !(term == currentTerm && isleader) {
+		// 	return
+		// }
 		if sm.applyIndex >= index {
 			reply.Err = OK
-			reply.WrongLeader = false
 			return
 		}
 	}
@@ -183,9 +180,8 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 		GID:       args.GID,
 		Shard:     args.Shard,
 	}
-	index, term, isLeader := sm.rf.Start(op)
-	reply.WrongLeader = true
-	reply.Err = "wrong shardmaster leader; try another!\n"
+	index, _, isLeader := sm.rf.Start(op)
+	reply.Err = WrongLeader
 	if isLeader == false {
 		return
 	}
@@ -195,13 +191,12 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
 		time.Sleep(period)
-		currentTerm, isleader := sm.rf.GetState()
-		if !(term == currentTerm && isleader) {
-			return
-		}
+		// currentTerm, isleader := sm.rf.GetState()
+		// if !(term == currentTerm && isleader) {
+		// 	return
+		// }
 		if sm.applyIndex >= index {
 			reply.Err = OK
-			reply.WrongLeader = false
 			return
 		}
 	}
@@ -220,9 +215,8 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		ClerkId:   args.ClerkId,
 		Num:       args.Num,
 	}
-	index, term, isLeader := sm.rf.Start(op)
-	reply.WrongLeader = true
-	reply.Err = "wrong shardmaster leader; try another!\n"
+	index, _, isLeader := sm.rf.Start(op)
+	reply.Err = WrongLeader
 	if isLeader == false {
 		return
 	}
@@ -232,23 +226,22 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	period := time.Duration(checkLeaderPeriod) * time.Millisecond
 	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
 		time.Sleep(period)
-		currentTerm, isleader := sm.rf.GetState()
-		if !(term == currentTerm && isleader) {
-			return
-		}
+		// currentTerm, isleader := sm.rf.GetState()
+		// if !(term == currentTerm && isleader) {
+		// 	return
+		// }
 		if sm.applyIndex >= index {
 			sm.lock("is reading config %d", args.Num)
-			if args.Num < len(sm.configs) && args.Num > 0 {
-				reply.Config = sm.configs[args.Num]
-			} else if args.Num == -1 {
-				reply.Config = sm.configs[sm.lastNum]
-			} else {
-				reply.Config = Config{}
-				reply.Err = InvalidNum
+			result := sm.applyResult[index]
+			delete(sm.applyResult, index)
+			sm.unlock("finished reading config %d: %v", args.Num, result)
+			switch result.(type) {
+			case Err:
+				reply.Err = result.(Err)
+			case Config:
+				reply.Err = OK
+				reply.Config = result.(Config)
 			}
-			sm.unlock("finished reading config %d", args.Num)
-			reply.Err = OK
-			reply.WrongLeader = false
 			return
 		}
 	}
@@ -264,11 +257,21 @@ func (sm *ShardMaster) checkApplyMsg() {
 			}
 			op := applyMsg.Command.(Op)
 			sm.lock("starts to apply index %d, op %s", applyMsg.CommandIndex, op2string(op))
-			if sm.lastRequestId[op.ClerkId] == op.RequestId {
-				sm.DPrintf("duplicate request %d by %d", op.RequestId, op.ClerkId)
+			if op.Type == query {
+				r := Config{}
+				if op.Num < len(sm.configs) && op.Num > 0 {
+					r = sm.configs[op.Num]
+				} else if op.Num == -1 {
+					r = sm.configs[sm.lastNum]
+				}
+				sm.applyResult[applyMsg.CommandIndex] = r
 			} else {
-				sm.applyOp(op)
-				sm.lastRequestId[op.ClerkId] = op.RequestId
+				if sm.lastRequestId[op.ClerkId] == op.RequestId {
+					sm.DPrintf("duplicate request %d by %d", op.RequestId, op.ClerkId)
+				} else {
+					sm.applyOp(op)
+					sm.lastRequestId[op.ClerkId] = op.RequestId
+				}
 			}
 			sm.applyIndex++
 			sm.unlock("ends applying index %d, op %s", applyMsg.CommandIndex, op2string(op))
@@ -299,9 +302,6 @@ func copyConfig(o Config) Config {
 
 // note that when the following function executes, it's under a mutex lock
 func (sm *ShardMaster) applyOp(op Op) {
-	if op.Type == query {
-		return
-	}
 	c := copyConfig(sm.configs[sm.lastNum])
 	c.Num = sm.lastNum + 1
 	gid2shards := make(map[int][]int)
@@ -489,6 +489,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.applyIndex = 0
 	sm.lastRequestId = make(map[int64]int64)
 	sm.gid2shards = make(map[int][]int)
+	sm.applyResult = make(map[int]interface{})
 
 	// a function for receiving notifications from the applyCh
 	go sm.checkApplyMsg()

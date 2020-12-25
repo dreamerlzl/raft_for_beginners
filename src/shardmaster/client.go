@@ -12,6 +12,11 @@ import (
 	"../labrpc"
 )
 
+const (
+	queryRetryTime int = 100
+	waitTime           = 20
+)
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
@@ -44,11 +49,15 @@ func (ck *Clerk) Query(num int) Config {
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardMaster.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
+			if ok {
+				if reply.Err == OK {
+					return reply.Config
+				} else if reply.Err == InvalidNum {
+					time.Sleep(time.Millisecond * time.Duration(waitTime))
+				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(time.Duration(queryRetryTime) * time.Millisecond)
 	}
 }
 
@@ -63,8 +72,10 @@ func (ck *Clerk) Join(servers map[int][]string) {
 		for _, srv := range ck.servers {
 			var reply JoinReply
 			ok := srv.Call("ShardMaster.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
+			if ok {
+				if reply.Err == OK {
+					return
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -82,8 +93,10 @@ func (ck *Clerk) Leave(gids []int) {
 		for _, srv := range ck.servers {
 			var reply LeaveReply
 			ok := srv.Call("ShardMaster.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
+			if ok {
+				if reply.Err == OK {
+					return
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -102,8 +115,10 @@ func (ck *Clerk) Move(shard int, gid int) {
 		for _, srv := range ck.servers {
 			var reply MoveReply
 			ok := srv.Call("ShardMaster.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
+			if ok {
+				if reply.Err == OK {
+					return
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)

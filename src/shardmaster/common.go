@@ -102,8 +102,9 @@ type Config struct {
 type Err string
 
 const (
-	OK         Err = "OK"
-	InvalidNum Err = "InvalidNum"
+	OK          Err = "OK"
+	InvalidNum  Err = "InvalidNum"
+	WrongLeader Err = "WrongLeader"
 )
 
 type JoinArgs struct {
@@ -113,8 +114,7 @@ type JoinArgs struct {
 }
 
 type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type LeaveArgs struct {
@@ -124,8 +124,7 @@ type LeaveArgs struct {
 }
 
 type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type MoveArgs struct {
@@ -136,8 +135,7 @@ type MoveArgs struct {
 }
 
 type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type QueryArgs struct {
@@ -147,7 +145,6 @@ type QueryArgs struct {
 }
 
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }
