@@ -15,6 +15,7 @@ const (
 	ErrWrongGroup  Err = "ErrWrongGroup"
 	ErrWrongLeader Err = "ErrWrongLeader"
 	ErrDuplicate   Err = "ErrDuplicate"
+	ErrLagConfig   Err = "ErrLagConfig"
 )
 
 type Err string
@@ -48,13 +49,15 @@ type GetReply struct {
 	Value string
 }
 
-type GetShardArgs struct {
-	ShardNum int
-	Shard    map[string]string
+type PullArgs struct {
+	Ver   int
+	Shard int
+	From  int
 }
 
-type GetShardReply struct {
-	Err Err
+type PullReply struct {
+	Data map[string]string
+	Err  Err
 }
 
 func shardCopy(data map[string]string) map[string]string {
@@ -63,4 +66,14 @@ func shardCopy(data map[string]string) map[string]string {
 		r[k] = v
 	}
 	return r
+}
+
+func mapKeys(data map[int]map[string]string) []int {
+	keys := make([]int, len(data))
+	i := 0
+	for k := range data {
+		keys[i] = k
+		i++
+	}
+	return keys
 }

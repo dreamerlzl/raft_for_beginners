@@ -30,8 +30,8 @@ import (
 	"../labrpc"
 )
 
-var logLevel = logrus.DebugLevel
-var heartbeatPeriod = 20
+var logLevel = logrus.WarnLevel
+var heartbeatPeriod = 50
 var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
 var electTimeoutRange = 250
 var applyPeriod = 2 * heartbeatPeriod
@@ -409,17 +409,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			time.Sleep(time.Duration(applyPeriod))
 			if rf.lastSent < rf.commitIndex {
 				rf.lock("[%d] starts to send applyMsg", rf.me)
-				for rf.lastSent = MaxInt(rf.lastIncludedIndex, rf.lastSent); rf.lastSent < rf.commitIndex; {
+				rf.lastSent = MaxInt(rf.lastIncludedIndex, rf.lastSent)
+				num := rf.commitIndex - rf.lastSent
+				applyMsgs := make([]ApplyMsg, num)
+				for i := 0; rf.lastSent < rf.commitIndex; i++ {
 					rf.lastSent++
 					applyMsg := ApplyMsg{
 						Command:      rf.getLogEntry(rf.lastSent).Command,
 						CommandIndex: rf.lastSent,
 						CommandValid: true,
 					}
+					applyMsgs[i] = applyMsg
 					logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastSent)
-					rf.applyCh <- applyMsg
+					// rf.applyCh <- applyMsg
 				}
 				rf.unlock("[%d] finished sending applyMsg", rf.me)
+				for i := 0; i < num; i++ {
+					rf.applyCh <- applyMsgs[i]
+				}
 			}
 		}
 	}()

@@ -10,6 +10,7 @@ package shardkv
 
 import (
 	"crypto/rand"
+	"log"
 	"math/big"
 	"time"
 
@@ -82,6 +83,7 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		log.Printf("[ck %d][get] sees shard %d belongs to groupd %d with config %d", ck.clerkId, shard, gid, ck.config.Num)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
@@ -92,6 +94,7 @@ func (ck *Clerk) Get(key string) string {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					log.Printf("[ck %d][get] errwronggroup: shard %d for group %d", ck.clerkId, shard, gid)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -121,6 +124,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		log.Printf("[ck %d][get] sees shard %d belongs to groupd %d with config %d", ck.clerkId, shard, gid, ck.config.Num)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
@@ -131,6 +135,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break
+				}
+				if ok && reply.Err == ErrDuplicate {
+					return
 				}
 				// ... not ok, or ErrWrongLeader
 			}
