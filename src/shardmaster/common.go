@@ -99,11 +99,12 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
-const (
-	OK = "OK"
-)
-
 type Err string
+
+const (
+	OK         Err = "OK"
+	InvalidNum Err = "InvalidNum"
+)
 
 type JoinArgs struct {
 	Servers   map[int][]string // new GID -> servers mappings

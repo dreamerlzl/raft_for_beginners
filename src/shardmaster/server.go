@@ -1,6 +1,7 @@
 package shardmaster
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"sync"
@@ -11,9 +12,13 @@ import (
 	"../raft"
 )
 
-const debug = 1
-const checkLeaderPeriod = 50
-const rpcTimeout = 500
+const debug = 0
+const (
+	checkLeaderPeriod   = 50
+	checkSnapshotPeriod = 150
+	rpcTimeout          = 500
+)
+const ratio float32 = 0.90 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
 
 type ShardMaster struct {
 	mu      sync.Mutex
@@ -239,7 +244,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 				reply.Config = sm.configs[sm.lastNum]
 			} else {
 				reply.Config = Config{}
-				reply.Err = "Invalid configuration number"
+				reply.Err = InvalidNum
 			}
 			sm.unlock("finished reading config %d", args.Num)
 			reply.Err = OK
@@ -258,17 +263,18 @@ func (sm *ShardMaster) checkApplyMsg() {
 				panic("application not in order")
 			}
 			op := applyMsg.Command.(Op)
-			sm.lock("starts to apply op %s", op2string(op))
+			sm.lock("starts to apply index %d, op %s", applyMsg.CommandIndex, op2string(op))
 			if sm.lastRequestId[op.ClerkId] == op.RequestId {
 				sm.DPrintf("duplicate request %d by %d", op.RequestId, op.ClerkId)
 			} else {
 				sm.applyOp(op)
 				sm.lastRequestId[op.ClerkId] = op.RequestId
-				sm.applyIndex++
 			}
-			sm.unlock("ends applying op %s", op2string(op))
+			sm.applyIndex++
+			sm.unlock("ends applying index %d, op %s", applyMsg.CommandIndex, op2string(op))
 		} else {
 			// reserved for snapshots!
+			sm.loadSnapshot(applyMsg.Snapshot)
 		}
 	}
 }
@@ -476,6 +482,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
+	sm.loadSnapshot(sm.rf.GetSnapshot())
 
 	// Your code here.
 	sm.lastNum = 0
@@ -485,5 +492,67 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	// a function for receiving notifications from the applyCh
 	go sm.checkApplyMsg()
+
+	go func() {
+		for {
+			if sm.rf.GetStateSize() >= int(ratio*float32(1000)) {
+				sm.lock("starts to encode snapshot")
+				snapshot := sm.encodeSnapshot()
+				applyIndex := sm.applyIndex
+				sm.unlock("finishes encoding snapshot with applyIndex %d", applyIndex)
+				sm.rf.TakeSnapshot(snapshot, applyIndex)
+			}
+			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)
+		}
+	}()
 	return sm
+}
+
+func (sm *ShardMaster) encodeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(sm.applyIndex) != nil {
+		panic("fail to encode sm.applyIndex!")
+	}
+	if e.Encode(sm.lastNum) != nil {
+		panic("fail to encode sm.lastConfigVer!")
+	}
+	if e.Encode(sm.configs) != nil {
+		panic("fail to encode sm.data!")
+	}
+	if e.Encode(sm.lastRequestId) != nil {
+		panic("fail to encode sm.lastRequestId!")
+	}
+	if e.Encode(sm.gid2shards) != nil {
+		panic("fail to encode sm.shardVersion!")
+	}
+	return w.Bytes()
+}
+
+//TODO; add fields
+func (sm *ShardMaster) loadSnapshot(snapshot []byte) {
+	if len(snapshot) > 0 {
+		sm.lock("starts to load snapshot...")
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		var configs []Config
+		var lastRequestId map[int64]int64
+		var gid2shard map[int][]int
+		var applyIndex int
+		var lastNum int
+		if d.Decode(&applyIndex) != nil ||
+			d.Decode(&lastNum) != nil ||
+			d.Decode(&configs) != nil ||
+			d.Decode(&lastRequestId) != nil ||
+			d.Decode(&gid2shard) != nil {
+			sm.DPrintf("fails to read snapshot!")
+			panic("fail to read snapshot")
+		}
+		sm.applyIndex = applyIndex
+		sm.configs = configs
+		sm.lastRequestId = lastRequestId
+		sm.lastNum = lastNum
+		sm.gid2shards = gid2shard
+		sm.unlock("load snapshot with applyIndex: %d", sm.applyIndex)
+	}
 }
