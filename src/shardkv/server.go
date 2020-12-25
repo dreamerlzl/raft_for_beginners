@@ -195,10 +195,9 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		switch op.(type) {
 		case Pull:
 			sop := op.(Pull)
-			// if sop.ver > kv.ver[me]+1 {
-			// 	kv.DPrintf("pull skip version %d", kv.ver[me]+1)
-			// 	panic("skipping version")
-			// }
+			if sop.ver > kv.ver[me]+1 {
+				kv.DPrintf("lagging for %d", kv.ver[me]+1)
+			}
 			var data map[string]string
 			_, isLeader := kv.rf.GetState()
 			if isLeader {
@@ -273,10 +272,10 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		case UpdateShard:
 			sop := op.(UpdateShard)
 			if sop.ver > kv.ver[me] {
-				// if sop.ver != kv.ver[me]+1 {
-				// 	kv.DPrintf("skip update version %d for shard %d", kv.ver[me]+1, me)
-				// 	panic("unexpected update version")
-				// }
+				if sop.ver != kv.ver[me]+1 {
+					kv.DPrintf("skip update version %d for shard %d", kv.ver[me]+1, me)
+					panic("unexpected update version")
+				}
 				kv.ver[me] = sop.ver
 				if sop.changed {
 					kv.data[me] = sop.data
@@ -667,9 +666,8 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 				}
 				kv.toGet++
 				kv.giveShardOp(i, sop)
-			} else if kv.lastConfig.Shards[i] == kv.gid {
-				// shard i belongs to me in the last config,
-				// but not this new config
+			} else {
+				// to advance the shard version
 				kv.giveShardOp(i, Abandon{ver: config.Num})
 			}
 		}
