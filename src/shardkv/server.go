@@ -264,10 +264,12 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			// 	sop.result <- data
 			// }
 			if sop.ver > kv.ver[me]+1 {
+				kv.DPrintf("ErrLagConfig: my version: %d, expected version: %d", kv.ver[me], sop.ver)
 				sop.result <- ErrLagConfig
 			} else {
 				copy := shardCopy(kv.data[me])
 				sop.result <- copy
+				valid = false // ownership transfer!
 			}
 		case UpdateShard:
 			sop := op.(UpdateShard)
@@ -357,8 +359,9 @@ func (kv *ShardKV) Pull(args *PullArgs, reply *PullReply) {
 					reply.Err = OK
 				}
 			case <-timer.C:
-				kv.DPrintf("fail to get shard %d v %d due to  timeout", args.Shard, args.Ver)
+				kv.DPrintf("fail to get shard %d v %d due to timeout", args.Shard, args.Ver)
 			}
+			return
 		}
 	}
 }
