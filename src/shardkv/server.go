@@ -22,7 +22,7 @@ const (
 	rpcTimeout          = 100
 	maxShards           = 10
 	opChannelBufferSize = 10
-	maxGetShardTime     = 50
+	maxGetShardTime     = 100
 	waitLagReplicaTime  = 100
 )
 const logLevel = logrus.DebugLevel
@@ -195,8 +195,8 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		switch op.(type) {
 		case Pull:
 			sop := op.(Pull)
-			// if sop.ver != ver+1 {
-			// 	kv.DPrintf("pull skip version %d", ver+1)
+			// if sop.ver > kv.ver[me]+1 {
+			// 	kv.DPrintf("pull skip version %d", kv.ver[me]+1)
 			// 	panic("skipping version")
 			// }
 			var data map[string]string
@@ -273,8 +273,8 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		case UpdateShard:
 			sop := op.(UpdateShard)
 			if sop.ver > kv.ver[me] {
-				// if sop.ver != ver+1 {
-				// 	kv.DPrintf("skip update version %d for shard %d", ver+1, me)
+				// if sop.ver != kv.ver[me]+1 {
+				// 	kv.DPrintf("skip update version %d for shard %d", kv.ver[me]+1, me)
 				// 	panic("unexpected update version")
 				// }
 				kv.ver[me] = sop.ver
@@ -320,7 +320,7 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int) map[string]string {
 			kv.DPrintf("retry pulling shard %d version %d from %d...", shard, ver, gid)
 		}
 	} else {
-		kv.DPrintf("can't find group %d's peers", gid)
+		kv.DPrintf("can't find group %d's peers: %d, %v", gid, kv.lastConfig.Num, kv.lastConfig.Groups)
 		panic("unexpected group setting")
 	}
 }
@@ -352,11 +352,13 @@ func (kv *ShardKV) Pull(args *PullArgs, reply *PullReply) {
 			case r := <-sop.result:
 				switch r.(type) {
 				case Err:
+					kv.DPrintf("fail to get shard %d v %d due to %v", args.Shard, args.Ver, r.(Err))
 				case map[string]string:
 					reply.Data = r.(map[string]string)
 					reply.Err = OK
 				}
 			case <-timer.C:
+				kv.DPrintf("fail to get shard %d v %d due to  timeout", args.Shard, args.Ver)
 			}
 		}
 	}
@@ -703,22 +705,9 @@ func (kv *ShardKV) pollConfig() {
 		// only issue update when the configuration changes
 		// it's OK to have stale leaders doing the same job
 		if isLeader {
-			config := kv.sm_ck.Query(-1)
-			if config.Num > kv.lastPollConfigNum {
-				kv.lastPollConfigNum = config.Num
-				kv.DPrintf("sees config %d", config.Num)
-				op := Op{
-					Type:      "UpdateConfig",
-					Config:    config,
-					RequestId: -1,
-					ClerkId:   -1,
-				}
-				kv.rf.Start(op)
-			}
-			// always poll for the next configuration, not skipping any
-			// config := kv.sm_ck.Query(kv.lastPollConfigNum + 1)
-			// if config.Num == kv.lastPollConfigNum+1 {
-			// 	kv.lastPollConfigNum++
+			// config := kv.sm_ck.Query(-1)
+			// if config.Num > kv.lastPollConfigNum {
+			// 	kv.lastPollConfigNum = config.Num
 			// 	kv.DPrintf("sees config %d", config.Num)
 			// 	op := Op{
 			// 		Type:      "UpdateConfig",
@@ -728,6 +717,20 @@ func (kv *ShardKV) pollConfig() {
 			// 	}
 			// 	kv.rf.Start(op)
 			// }
+
+			// always poll for the next configuration, not skipping any
+			config := kv.sm_ck.Query(kv.lastPollConfigNum + 1)
+			if config.Num == kv.lastPollConfigNum+1 {
+				kv.lastPollConfigNum++
+				kv.DPrintf("sees config %d", config.Num)
+				op := Op{
+					Type:      "UpdateConfig",
+					Config:    config,
+					RequestId: -1,
+					ClerkId:   -1,
+				}
+				kv.rf.Start(op)
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
