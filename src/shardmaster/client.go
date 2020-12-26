@@ -6,6 +6,7 @@ package shardmaster
 
 import (
 	"crypto/rand"
+	"log"
 	"math/big"
 	"time"
 
@@ -53,6 +54,7 @@ func (ck *Clerk) Query(num int) Config {
 				if reply.Err == OK {
 					return reply.Config
 				} else if reply.Err == InvalidNum {
+					log.Printf("[ck %d] invalid config num: %d", ck.clerkId, num)
 					time.Sleep(time.Millisecond * time.Duration(waitTime))
 				}
 			}

@@ -258,8 +258,8 @@ func (sm *ShardMaster) checkApplyMsg() {
 			op := applyMsg.Command.(Op)
 			sm.lock("starts to apply index %d, op %s", applyMsg.CommandIndex, op2string(op))
 			if op.Type == query {
-				r := Config{}
-				if op.Num < len(sm.configs) && op.Num > 0 {
+				var r interface{} = InvalidNum
+				if op.Num < len(sm.configs) && op.Num >= 0 {
 					r = sm.configs[op.Num]
 				} else if op.Num == -1 {
 					r = sm.configs[sm.lastNum]
@@ -482,7 +482,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
-	sm.loadSnapshot(sm.rf.GetSnapshot())
 
 	// Your code here.
 	sm.lastNum = 0
@@ -490,6 +489,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.lastRequestId = make(map[int64]int64)
 	sm.gid2shards = make(map[int][]int)
 	sm.applyResult = make(map[int]interface{})
+	sm.loadSnapshot(sm.rf.GetSnapshot())
 
 	// a function for receiving notifications from the applyCh
 	go sm.checkApplyMsg()
