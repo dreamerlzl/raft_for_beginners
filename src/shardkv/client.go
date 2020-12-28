@@ -83,7 +83,7 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		log.Printf("[ck %d][get] sees shard %d belong to groupd %d with config %d, %v", ck.clerkId, shard, gid, ck.config.Num, ck.config.Shards)
+		log.Printf("[ck %d][get] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
@@ -124,7 +124,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		log.Printf("[ck %d][pa] sees shard %d belong to groupd %d with config %d, %v", ck.clerkId, shard, gid, ck.config.Num, ck.config.Shards)
+		log.Printf("[ck %d][pa] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
@@ -133,12 +133,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok {
 					switch reply.Err {
 					case OK:
-						log.Printf("[ck %d][pa] finish %s %s %s", ck.clerkId, op, key, value)
+						log.Printf("[ck %d][pa] finish %s %s %s at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						return
 					case ErrDuplicate:
+						log.Printf("[ck %d][pa] %s %s %s duplicate request at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						return
 					case ErrWrongGroup:
+						log.Printf("[ck %d][pa] %s %s %s wrong group at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						break
+					default:
+						log.Printf("[ck %d][pa] %s %s %s err: %v at %d, %s", ck.clerkId, op, key, value, reply.Err, gid, servers[si])
 					}
 				}
 				// ... not ok, or ErrWrongLeader

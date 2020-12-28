@@ -99,6 +99,15 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func CopyConfig(c Config) Config {
+	r := c
+	r.Groups = make(map[int][]string)
+	for k, v := range c.Groups {
+		r.Groups[k] = v
+	}
+	return r
+}
+
 type Err string
 
 const (

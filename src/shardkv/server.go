@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"../labgob"
@@ -20,10 +21,11 @@ const (
 	checkLeaderPeriod   = 20
 	checkSnapshotPeriod = 150
 	rpcTimeout          = 100
-	maxShards           = 10
+	requestTimeout      = 200
 	opChannelBufferSize = 10
 	maxGetShardTime     = 100
 	waitLagReplicaTime  = 100
+	retryPullTime       = 50
 )
 const logLevel = logrus.DebugLevel
 const ratio float32 = 0.90 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
@@ -35,8 +37,13 @@ type Op struct {
 	Type      string
 	Key       string
 	Value     string
-	RequestId int64
 	ClerkId   int64
+	RequestId int64
+	Begin     chan bool
+	Finish    chan bool
+	Me        int
+	Uid       int64    // different each startup
+	Result    chan Err // for put/append
 
 	// for updateConfig and Init
 	Config shardmaster.Config
@@ -47,7 +54,7 @@ type Op struct {
 	Ver     int
 	Changed bool
 
-	// for get shard
+	// for GetShard
 	From int
 }
 
@@ -72,6 +79,17 @@ type Put struct {
 
 func (p Put) sop2string() string {
 	return fmt.Sprintf("put %s %s", p.key, p.value)
+}
+
+type TryUpdate struct {
+	op     string
+	key    string
+	value  string
+	result chan interface{}
+}
+
+func (a TryUpdate) sop2string() string {
+	return fmt.Sprintf("try %s %s %s", a.op, a.key, a.value)
 }
 
 type Append struct {
@@ -120,26 +138,33 @@ func (u UpdateShard) sop2string() string {
 	return fmt.Sprintf("update to v %d, %v", u.ver, u.data)
 }
 
+type Terminate struct {
+}
+
+func (t Terminate) sop2string() string {
+	return fmt.Sprintf("get killed")
+}
+
 func op2string(op Op) (r string) {
 	switch op.Type {
 	case "Get":
 		r = fmt.Sprintf("get %s, clerk %d, request %d", op.Key, op.ClerkId, op.RequestId)
+	case "PutAppend":
+		r = fmt.Sprintf("put/append %s %s, %d, clerk %d, request %d", op.Key, op.Value, op.Me, op.ClerkId, op.RequestId)
 	case "Put":
-		r = fmt.Sprintf("put %s %v, clerk %d, request %d", op.Key, op.Value, op.ClerkId, op.RequestId)
+		r = fmt.Sprintf("put %s %s, clerk %d, request %d", op.Key, op.Value, op.ClerkId, op.RequestId)
 	case "Append":
-		r = fmt.Sprintf("append %s %v, clerk %d, request %d", op.Key, op.Value, op.ClerkId, op.RequestId)
-	case "Init":
-		r = fmt.Sprintf("init shards %v", op.Config)
+		r = fmt.Sprintf("append %s %s, clerk %d, request %d", op.Key, op.Value, op.ClerkId, op.RequestId)
 	case "UpdateConfig":
 		r = fmt.Sprintf("update config to %d: %v", op.Config.Num, op.Config.Shards)
 	case "UpdateShard":
 		r = fmt.Sprintf("update shard %d v %d as %v", op.Shard, op.Ver, op.Data)
 	case "DelayedAbandon":
 		r = fmt.Sprintf("delayed abandon shard %d v %d", op.Shard, op.Ver)
-	case "GetShard":
-		r = fmt.Sprintf("%d wants to get shard %d v %d", op.From, op.Shard, op.Ver)
+	case "Pull":
+		r = fmt.Sprintf("%d wants to pull shard %d v %d", op.From, op.Shard, op.Ver)
 	default:
-		fmt.Printf("unexpected type %v:", op.Type)
+		fmt.Printf("unexpected type: %v\n", op.Type)
 		panic("unexpected type!")
 	}
 	return
@@ -163,13 +188,15 @@ type ShardKV struct {
 	data              []map[string]string // shard -> key -> value
 	ver               []int
 	lastRequestId     map[int64]int64 // ClerkId -> last finished RequestId
-	applyResult       map[int]interface{}
 	applyIndex        int
 	shardOp           map[int]chan ShardOp
 	mu2               sync.Mutex //to avoid concurrent hashmap write
 	// to ensure that when the leader fails during a reconfig,
 	// the new leader can retry the reconfig
-	toGet int
+	toGet      int
+	dead       int32
+	killedChan chan bool
+	uid        int64
 }
 
 func (kv *ShardKV) giveShardOp(shard int, op ShardOp) {
@@ -199,19 +226,23 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	go func(sops chan Pull) {
 		for sop := range sops {
 			var data map[string]string
+			var killed bool
 			lastConfig := kv.configs[sop.ver-1]
 			gid := lastConfig.Shards[me]
 			servers := lastConfig.Groups[gid]
 			if gid != kv.gid {
-				data = kv.pullFrom(gid, me, sop.ver, servers)
+				data, killed = kv.pullFrom(gid, me, sop.ver, servers)
+			} else {
+				killed = kv.killed()
+			}
+			if killed {
+				return
 			}
 			op := Op{
-				Type:      "UpdateShard",
-				ClerkId:   -1,
-				RequestId: -1,
-				Data:      data,
-				Ver:       sop.ver,
-				Shard:     me,
+				Type:  "UpdateShard",
+				Data:  data,
+				Ver:   sop.ver,
+				Shard: me,
 				// the shard belongs to me in the last and the current version;
 				// no need to pull from another replica group
 				Changed: gid != kv.gid,
@@ -224,6 +255,9 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		op := <-ops
 		kv.DPrintf(fmt.Sprintf("shard %d, ver %d: ", me, kv.ver[me]) + op.sop2string())
 		switch op.(type) {
+		case Terminate:
+			close(pullChan)
+			return
 		case Pull:
 			_, isLeader := kv.rf.GetState()
 			if isLeader {
@@ -271,11 +305,9 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				// this abandon appears earlier than the finish of last update
 				// needs to delay a bit
 				op := Op{
-					Type:      "DelayedAbandon",
-					Ver:       sop.ver,
-					Shard:     me,
-					ClerkId:   -1,
-					RequestId: -1,
+					Type:  "DelayedAbandon",
+					Ver:   sop.ver,
+					Shard: me,
 				}
 				kv.rf.Start(op)
 			} else if sop.ver == kv.ver[me]+1 {
@@ -324,7 +356,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	}
 }
 
-func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) map[string]string {
+func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (map[string]string, bool) {
 	args := PullArgs{
 		Shard: shard,
 		Ver:   ver,
@@ -346,11 +378,15 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) map[s
 					time.Sleep(waitLagReplicaTime * time.Millisecond)
 				case OK:
 					kv.DPrintf("fetch s %d v %d from %d!", shard, ver, gid)
-					return reply.Data
+					return reply.Data, false
 				}
 			} else {
 				si++
 			}
+		}
+		time.Sleep(time.Duration(retryPullTime) * time.Millisecond)
+		if kv.killed() {
+			return nil, true
 		}
 		kv.DPrintf("retry pulling shard %d version %d from %d...", shard, ver, gid)
 	}
@@ -358,40 +394,47 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) map[s
 
 func (kv *ShardKV) Pull(args *PullArgs, reply *PullReply) {
 	// a dummy Op
-	index, _, isLeader := kv.rf.Start(Op{
-		Type:      "GetShard",
-		From:      args.From,
-		Ver:       args.Ver,
-		Shard:     args.Shard,
-		RequestId: -1,
-		ClerkId:   -1,
-	})
+	begin := make(chan bool, 1)
+	finish := make(chan bool, 1)
+	op := Op{
+		Type:   "Pull",
+		From:   args.From,
+		Ver:    args.Ver,
+		Shard:  args.Shard,
+		Finish: finish,
+		Begin:  begin,
+		Me:     kv.me,
+		Uid:    kv.uid,
+	}
+	_, _, isLeader := kv.rf.Start(op)
 	reply.Err = ErrWrongLeader
 	if !isLeader {
 		return
 	}
 	kv.DPrintf("notices that %d wants to get shard %d for %v", args.From, args.Shard, args.Ver)
 
-	period := time.Duration(checkLeaderPeriod) * time.Millisecond
-	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
-		time.Sleep(period)
-		if kv.applyIndex >= index {
-			// we can confirm that only leader can arrive here
-			kv.lock("is reading index %d's result", index)
-			result := kv.applyResult[index]
-			delete(kv.applyResult, index)
-			kv.unlock("finished reading index %d's result %v", index, result)
-			switch result.(type) {
-			case Err:
-				kv.DPrintf("fail to get shard %d v %d due to %v", args.Shard, args.Ver, result.(Err))
-				reply.Err = result.(Err)
-			case map[string]string:
-				reply.Data = result.(map[string]string)
-				reply.Err = OK
-			}
-			return
+	timer := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-begin:
+		sop := GetShard{
+			ver:  op.Ver,
+			from: op.From,
+		}
+		sop.result = make(chan interface{}, 1)
+		kv.giveShardOp(op.Shard, sop)
+		result := <-sop.result
+		switch result.(type) {
+		case Err:
+			kv.DPrintf("fail to let %d get shard %d v %d from %d, %d due to %v", args.From, args.Shard, args.Ver, kv.gid, kv.me, result.(Err))
+			reply.Err = result.(Err)
+		case map[string]string:
+			reply.Data = result.(map[string]string)
+			reply.Err = OK
 		}
 	}
+	close(finish)
 }
 
 type logWriter struct {
@@ -403,8 +446,8 @@ func (writer logWriter) Write(bytes []byte) (int, error) {
 
 func (kv *ShardKV) DPrintf(msg string, f ...interface{}) {
 	if Debug {
-		log.Printf("[gid %d, kv %d] %s", kv.gid, kv.me, fmt.Sprintf(msg, f...))
-		logrus.Debugf("[gid %d, kv %d] %s", kv.gid, kv.me, fmt.Sprintf(msg, f...))
+		log.Printf("[gid %d, kv %d, %d] %s", kv.gid, kv.me, kv.uid, fmt.Sprintf(msg, f...))
+		// logrus.Debugf("[gid %d, kv %d, %d] %s", kv.gid, kv.me, fmt.Sprintf(msg, f...))
 	}
 }
 
@@ -422,11 +465,17 @@ func (kv *ShardKV) unlock(msg string, f ...interface{}) {
 //TODO
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	begin := make(chan bool, 1)
+	finish := make(chan bool, 1)
 	op := Op{
 		Type:      "Get",
 		Key:       args.Key,
-		RequestId: args.RequestId,
 		ClerkId:   args.ClerkId,
+		RequestId: args.RequestId,
+		Begin:     begin,
+		Finish:    finish,
+		Me:        kv.me,
+		Uid:       kv.uid,
 	}
 	index, _, isLeader := kv.rf.Start(op)
 	// by default, let the client retry
@@ -434,31 +483,34 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	if !isLeader {
 		return
 	}
+	kv.DPrintf("issues index %d, %s", index, op2string(op))
 
-	period := time.Duration(checkLeaderPeriod) * time.Millisecond
-	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
-		// periodically check the currentTerm and apply result
-		time.Sleep(period)
-		// currentTerm, isleader := kv.rf.GetState()
-		// if !(term == currentTerm && isleader) {
-		// 	reply.Err = ErrWrongLeader
-		// 	return
-		// }
-		if kv.applyIndex >= index {
-			kv.lock("is reading index %d's result", index)
-			result := kv.applyResult[index]
-			delete(kv.applyResult, index)
-			kv.unlock("finished reading index %d's result %v", index, result)
-			switch result.(type) {
-			case Err:
-				reply.Err = result.(Err) // ErrNoKey or ErrWrongGroup
-				kv.DPrintf("%v <- %s", reply.Err, op2string(op))
-			case string:
-				reply.Err = OK
-				reply.Value = result.(string)
-				kv.DPrintf("%v <- %s", reply.Value, op2string(op))
-			}
+	timer := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		kv.DPrintf("timeout for index %d get %s, ck %d request %d", index, args.Key, args.ClerkId, args.RequestId)
+	case <-begin:
+		defer close(finish)
+		if kv.lastRequestId[args.ClerkId] == args.RequestId {
+			// duplicate execution
+			kv.DPrintf("detects duplicate request %d", args.RequestId)
+			reply.Err = ErrDuplicate
 			return
+		}
+		sop := Get{
+			key: op.Key,
+		}
+		sop.result = make(chan interface{})
+		kv.giveShardOp(key2shard(op.Key), sop)
+		result := <-sop.result
+		switch result.(type) {
+		case Err:
+			reply.Err = result.(Err)
+		case string:
+			kv.lastRequestId[op.ClerkId] = op.RequestId
+			reply.Err = OK
+			reply.Value = result.(string)
 		}
 	}
 }
@@ -466,42 +518,64 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 //TODO
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	begin := make(chan bool, 1)
+	finish := make(chan bool, 1)
 	op := Op{
-		Type:      args.Op,
+		Type:      "PutAppend",
 		Key:       args.Key,
 		Value:     args.Value,
-		RequestId: args.RequestId,
 		ClerkId:   args.ClerkId,
+		RequestId: args.RequestId,
+		Begin:     begin,
+		Finish:    finish,
+		Me:        kv.me,
+		Uid:       kv.uid,
 	}
 	index, _, isLeader := kv.rf.Start(op)
 	reply.Err = ErrWrongLeader
 	if !isLeader {
 		return
 	}
+	kv.DPrintf("issues index %d, %s", index, op2string(op))
 
-	period := time.Duration(checkLeaderPeriod) * time.Millisecond
-	for iter := 0; iter < rpcTimeout/checkLeaderPeriod; iter++ {
-		// periodically check the currentTerm and apply result
-		time.Sleep(period)
-		// currentTerm, isleader := kv.rf.GetState()
-		// if !(term == currentTerm && isleader) {
-		// 	reply.Err = ErrWrongLeader
-		// 	return
-		// }
-		if kv.applyIndex >= index {
-			kv.lock("is reading index %d's result", index)
-			result := kv.applyResult[index]
-			delete(kv.applyResult, index)
-			kv.unlock("finished reading index %d's result", index)
-			switch result.(type) {
-			case string:
-				fmt.Printf(result.(string))
-				panic("unexpected string!\n")
-			default:
-				reply.Err = result.(Err)
-				kv.DPrintf("result of %d %s: %s", index, op2string(op), reply.Err)
-			}
+	timer := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		kv.DPrintf("timeout for %v %s %s , ck %d request %d", args.Op, args.Key, args.Value, args.ClerkId, args.RequestId)
+		close(finish)
+	case <-begin:
+		if kv.lastRequestId[args.ClerkId] == args.RequestId {
+			// duplicate execution
+			kv.DPrintf("detects duplicate request %d", args.RequestId)
+			reply.Err = ErrDuplicate
+			close(finish)
 			return
+		}
+		op2 := Op{
+			Type:      args.Op,
+			Key:       args.Key,
+			Value:     args.Value,
+			ClerkId:   args.ClerkId,
+			RequestId: args.RequestId,
+			Result:    make(chan Err, 1),
+			Me:        kv.me,
+			Uid:       kv.uid,
+		}
+		index, _, isLeader := kv.rf.Start(op2)
+		close(finish)
+		if !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		kv.DPrintf("issues index %d, %s", index, op2string(op2))
+		timer2 := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+		defer timer2.Stop()
+		select {
+		case reply.Err = <-op2.Result:
+		case <-timer2.C:
+			kv.DPrintf("fail to apply index %d, %s", index, op2string(op))
+			reply.Err = ErrWrongLeader
 		}
 	}
 }
@@ -513,8 +587,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	kv.DPrintf("begins to shutdown...")
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.killedChan <- true
+	kv.DPrintf("is killed with ver %d!", kv.configIndex)
+}
+
+func (kv *ShardKV) killed() bool {
+	return atomic.LoadInt32(&kv.dead) == 1
 }
 
 //
@@ -562,6 +644,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
+	kv.uid = nrand()
 	log.SetFlags(0)
 	log.SetOutput(new(logWriter))
 
@@ -580,10 +663,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.lastRequestId = make(map[int64]int64)
 	kv.applyIndex = 0 // as raft, 1 is the first meaingful index
-	kv.applyResult = make(map[int]interface{})
 	kv.shardOp = make(map[int]chan ShardOp)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.killedChan = make(chan bool)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	// read snapshot
 	kv.loadSnapshot(kv.rf.GetSnapshot())
@@ -598,10 +681,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 				kv.lock("start to encode snapshot")
 				snapshot := kv.encodeSnapshot()
 				applyIndex := kv.applyIndex
-				kv.unlock("finish encoding snapshot with applyIndex %d", applyIndex)
+				kv.unlock("finish copying snapshot with applyIndex %d", applyIndex)
 				kv.rf.TakeSnapshot(snapshot, applyIndex)
+				kv.DPrintf("finish encoding snapshot with applyIndex %d", applyIndex)
 			}
 			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)
+			if kv.killed() {
+				return
+			}
 		}
 	}()
 
@@ -610,37 +697,41 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 func (kv *ShardKV) checkApply() {
 	for {
-		applyMsg := <-kv.applyCh
-		if applyMsg.CommandValid {
-			if kv.applyIndex+1 != applyMsg.CommandIndex {
-				kv.DPrintf("application not in order! expected: %d, given: %d", kv.applyIndex+1, applyMsg.CommandIndex)
-				panic("application not in order")
+		select {
+		case <-kv.killedChan:
+			for i := 0; i < len(kv.configs[kv.configIndex].Shards); i++ {
+				kv.giveShardOp(i, Terminate{})
+				close(kv.shardOp[i])
 			}
-			op := applyMsg.Command.(Op)
-			kv.lock("receives applyMsg index %v %s", applyMsg.CommandIndex, op2string(op))
-			if op.Type == "" {
-				// dummy op, see Pull
-			} else if op.Type == "Get" || op.Type == "GetShard" {
-				kv.applyResult[applyMsg.CommandIndex] = kv.applyOp(op)
-			} else {
-				if op.RequestId > -1 && kv.lastRequestId[op.ClerkId] == op.RequestId {
-					// duplicate execution
-					kv.DPrintf("detects duplicate request %d for index %d", op.RequestId, applyMsg.CommandIndex)
-					kv.applyResult[applyMsg.CommandIndex] = ErrDuplicate
-				} else {
-					kv.applyResult[applyMsg.CommandIndex] = kv.applyOp(op)
-					if kv.applyResult[applyMsg.CommandIndex].(Err) != ErrWrongGroup {
-						kv.lastRequestId[op.ClerkId] = op.RequestId
-					}
-					kv.DPrintf("%v <- %s with index %d", kv.applyResult[applyMsg.CommandIndex].(Err), op2string(op), applyMsg.CommandIndex)
+			return
+		case applyMsg := <-kv.applyCh:
+			if applyMsg.CommandValid {
+				if kv.applyIndex+1 != applyMsg.CommandIndex {
+					kv.DPrintf("application not in order! expected: %d, given: %d", kv.applyIndex+1, applyMsg.CommandIndex)
+					panic("application not in order")
 				}
+				op := applyMsg.Command.(Op)
+				kv.lock("receives applyMsg index %v %s", applyMsg.CommandIndex, op2string(op))
+				if op.Type == "Get" || op.Type == "PutAppend" || op.Type == "Pull" {
+					// client request
+					if op.Me == kv.me && op.Uid == kv.uid {
+						kv.DPrintf("tries to execute client request %s", op2string(op))
+						op.Begin <- true
+						kv.DPrintf("waiting for execution of client request %s", op2string(op))
+						<-op.Finish
+					}
+				} else {
+					// not client request
+					result := kv.applyOp(op)
+					kv.DPrintf("%v <- %s with index %d", result.(Err), op2string(op), applyMsg.CommandIndex)
+				}
+				kv.applyIndex++
+				kv.unlock("finish applying %s with index: %d", op2string(op), applyMsg.CommandIndex)
+			} else {
+				// update the data with snapshot
+				kv.DPrintf("receives snapshot from rf")
+				kv.loadSnapshot(applyMsg.Snapshot)
 			}
-			kv.applyIndex++
-			kv.unlock("finish applying op with index: %d", applyMsg.CommandIndex)
-		} else {
-			// update the data with snapshot
-			kv.DPrintf("receives snapshot from rf")
-			kv.loadSnapshot(applyMsg.Snapshot)
 		}
 	}
 }
@@ -648,31 +739,47 @@ func (kv *ShardKV) checkApply() {
 func (kv *ShardKV) applyOp(op Op) interface{} {
 	// any string/OK (Err) for success, others for failure
 	shard := key2shard(op.Key)
+	var result interface{}
 	// No need to wait for Init and UpdateConfig
 	switch op.Type {
-	case "Get":
-		sop := Get{
-			key: op.Key,
-		}
-		sop.result = make(chan interface{})
-		kv.giveShardOp(shard, sop)
-		return <-sop.result
 	case "Put":
-		sop := Put{
-			key:   op.Key,
-			value: op.Value,
+		if kv.lastRequestId[op.ClerkId] == op.RequestId {
+			result = ErrDuplicate
+		} else {
+			sop := Put{
+				key:   op.Key,
+				value: op.Value,
+			}
+			sop.result = make(chan interface{})
+			kv.giveShardOp(shard, sop)
+			result = <-sop.result
+			if result.(Err) == OK {
+				kv.lastRequestId[op.ClerkId] = op.RequestId
+			}
 		}
-		sop.result = make(chan interface{})
-		kv.giveShardOp(shard, sop)
-		return <-sop.result
+		if kv.me == op.Me && kv.uid == op.Uid {
+			op.Result <- result.(Err)
+		}
+		return result
 	case "Append":
-		sop := Append{
-			key:   op.Key,
-			value: op.Value,
+		if kv.lastRequestId[op.ClerkId] == op.RequestId {
+			result = ErrDuplicate
+		} else {
+			sop := Append{
+				key:   op.Key,
+				value: op.Value,
+			}
+			sop.result = make(chan interface{})
+			kv.giveShardOp(shard, sop)
+			result = <-sop.result
+			if result.(Err) == OK {
+				kv.lastRequestId[op.ClerkId] = op.RequestId
+			}
 		}
-		sop.result = make(chan interface{})
-		kv.giveShardOp(shard, sop)
-		return <-sop.result
+		if kv.me == op.Me && kv.uid == op.Uid {
+			op.Result <- result.(Err)
+		}
+		return result
 	case "UpdateConfig":
 		config := shardmaster.CopyConfig(op.Config)
 		if config.Num <= kv.configIndex {
@@ -715,20 +822,21 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			kv.configIndex++
 			kv.DPrintf("successfully updates config from %d to %d", kv.configIndex-1, kv.configIndex)
 		}
-	case "GetShard":
-		sop := GetShard{
-			ver:  op.Ver,
-			from: op.From,
-		}
-		sop.result = make(chan interface{}, 1)
-		kv.giveShardOp(op.Shard, sop)
-		return <-sop.result
+	// case "GetShard":
+	// 	sop := GetShard{
+	// 		ver:  op.Ver,
+	// 		from: op.From,
+	// 	}
+	// 	sop.result = make(chan interface{}, 1)
+	// 	kv.giveShardOp(op.Shard, sop)
+	// 	return <-sop.result
 	case "DelayedAbandon":
 		sop := Abandon{
 			ver: op.Ver,
 		}
 		kv.giveShardOp(op.Shard, sop)
 	default:
+		kv.DPrintf("unexpected op type: %v\n", op.Type)
 		panic("unknown op type!")
 	}
 	return OK
@@ -740,34 +848,25 @@ func (kv *ShardKV) pollConfig() {
 		// only issue update when the configuration changes
 		// it's OK to have stale leaders doing the same job
 		if isLeader {
-			// config := kv.sm_ck.Query(-1)
-			// if config.Num > kv.lastPollConfigNum {
-			// 	kv.lastPollConfigNum = config.Num
-			// 	kv.DPrintf("sees config %d", config.Num)
-			// 	op := Op{
-			// 		Type:      "UpdateConfig",
-			// 		Config:    config,
-			// 		RequestId: -1,
-			// 		ClerkId:   -1,
-			// 	}
-			// 	kv.rf.Start(op)
-			// }
-
 			// always poll for the next configuration, not skipping any
 			config := kv.sm_ck.Query(kv.lastPollConfigNum + 1)
 			if config.Num == kv.lastPollConfigNum+1 {
 				kv.lastPollConfigNum++
 				kv.DPrintf("sees config %d: %v", config.Num, config.Shards)
 				op := Op{
-					Type:      "UpdateConfig",
-					Config:    config,
-					RequestId: -1,
-					ClerkId:   -1,
+					Type:   "UpdateConfig",
+					Config: config,
 				}
-				kv.rf.Start(op)
+				index, _, isLeader := kv.rf.Start(op)
+				if isLeader {
+					kv.DPrintf("issues index %d, %s", index, op2string(op))
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
+		if kv.killed() {
+			return
+		}
 	}
 }
 

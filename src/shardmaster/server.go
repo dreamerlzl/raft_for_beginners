@@ -12,7 +12,7 @@ import (
 	"../raft"
 )
 
-const debug = 1
+const debug = 0
 const (
 	checkLeaderPeriod   = 50
 	checkSnapshotPeriod = 150
@@ -260,9 +260,9 @@ func (sm *ShardMaster) checkApplyMsg() {
 			if op.Type == query {
 				var r interface{} = InvalidNum
 				if op.Num < len(sm.configs) && op.Num >= 0 {
-					r = sm.configs[op.Num]
-				} else if op.Num == -1 {
-					r = sm.configs[sm.lastNum]
+					r = copyConfig(sm.configs[op.Num])
+				} else if op.Num == -1 || op.Num >= len(sm.configs) {
+					r = copyConfig(sm.configs[sm.lastNum])
 				}
 				sm.applyResult[applyMsg.CommandIndex] = r
 			} else {
@@ -446,9 +446,11 @@ type Pair struct {
 
 type PairList []Pair
 
-func (p PairList) Len() int           { return len(p) }
-func (p PairList) Less(i, j int) bool { return p[i].Value < p[j].Value }
-func (p PairList) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+func (p PairList) Len() int { return len(p) }
+func (p PairList) Less(i, j int) bool {
+	return p[i].Value < p[j].Value || (p[i].Value == p[j].Value && p[i].Key < p[j].Key)
+}
+func (p PairList) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
 
 //
 // the tester calls Kill() when a ShardMaster instance won't
