@@ -55,8 +55,13 @@ type PullArgs struct {
 	From  int
 }
 
+type ShardInfo struct {
+	Data          map[string]string
+	LastRequestId map[int64]map[int64]bool
+}
+
 type PullReply struct {
-	Data map[string]string
+	Data ShardInfo
 	Err  Err
 }
 
