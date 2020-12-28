@@ -129,6 +129,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
+				args.Ver = ck.config.Num
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok {
 					switch reply.Err {
@@ -141,6 +142,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					case ErrWrongGroup:
 						log.Printf("[ck %d][pa] %s %s %s wrong group at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						break
+					case ErrLagConfig:
+						time.Sleep(time.Millisecond * waitLagReplicaTime)
 					default:
 						log.Printf("[ck %d][pa] %s %s %s err: %v at %d, %s", ck.clerkId, op, key, value, reply.Err, gid, servers[si])
 					}

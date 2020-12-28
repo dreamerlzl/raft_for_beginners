@@ -46,7 +46,7 @@ type Op struct {
 	// for updateConfig and Init
 	Config shardmaster.Config
 
-	// for update shards
+	// for update/modify shards
 	ShardInfo ShardInfo
 	Shard     int
 	Ver       int
@@ -72,6 +72,7 @@ func (g Get) sop2string() string {
 type Put struct {
 	key    string
 	value  string
+	ver    int
 	result chan interface{}
 }
 
@@ -82,6 +83,7 @@ func (p Put) sop2string() string {
 type Append struct {
 	key    string
 	value  string
+	ver    int
 	result chan interface{}
 }
 
@@ -205,8 +207,9 @@ func (kv *ShardKV) giveShardOp(shard int, op ShardOp) {
 func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	// if ver is 1, then it means that if a client also realizes config version 1,
 	// then the client can contact this kv for requests.
+	//kv.lock("starts to init valid")
 	kv.valid[me] = kv.configIndex > 0 && (kv.configs[kv.ver[me]].Shards[me] == kv.gid)
-	kv.DPrintf("starts handle shard %d v %d valid %v", me, kv.ver[me], kv.valid[me])
+	//kv.unlock("starts handle shard %d v %d valid %v", me, kv.ver[me], kv.valid[me])
 	// for pulling data from other groups
 	pullChan := make(chan Pull, 10)
 	go func(sops chan Pull) {
@@ -273,6 +276,8 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			sop := op.(Put)
 			if !kv.valid[me] {
 				sop.result <- ErrWrongGroup
+			} else if sop.ver > kv.ver[me] {
+				sop.result <- ErrLagConfig
 			} else {
 				kv.data[me][sop.key] = sop.value
 				sop.result <- OK
@@ -281,6 +286,8 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			sop := op.(Append)
 			if !kv.valid[me] {
 				sop.result <- ErrWrongGroup
+			} else if sop.ver > kv.ver[me] {
+				sop.result <- ErrLagConfig
 			} else {
 				if _, ok := kv.data[me][sop.key]; !ok {
 					sop.result <- ErrNoKey
@@ -338,10 +345,12 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				}
 				kv.ver[me] = sop.ver
 				if sop.changed {
-					kv.DPrintf("updates shard %d v %d from %v to %v\nlastRequestId: %v",
-						me, kv.ver[me], kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
+					// kv.lock("starts to update shard %d v %d from %v to %v\nlastRequestId: %v",
+					// 	me, kv.ver[me], kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
 					kv.data[me] = shardCopy(sop.shardinfo.Data)
-					kv.lastRequestId[me] = sop.shardinfo.LastRequestId
+					kv.lastRequestId[me] = lastRequestCopy(sop.shardinfo.LastRequestId)
+					// kv.unlock("finish update shard %d v %d from %v to %v\nlastRequestId: %v",
+					// 	me, kv.ver[me], kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
 				}
 				kv.valid[me] = true
 			} else {
@@ -468,6 +477,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:     args.Value,
 		ClerkId:   args.ClerkId,
 		RequestId: args.RequestId,
+		Ver:       args.Ver,
 		Me:        kv.me,
 		Uid:       kv.uid,
 		Result:    make(chan interface{}, 1),
@@ -685,6 +695,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			sop := Put{
 				key:   op.Key,
 				value: op.Value,
+				ver:   op.Ver,
 			}
 			sop.result = make(chan interface{})
 			kv.giveShardOp(shard, sop)
@@ -706,6 +717,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			sop := Append{
 				key:   op.Key,
 				value: op.Value,
+				ver:   op.Ver,
 			}
 			sop.result = make(chan interface{})
 			kv.giveShardOp(shard, sop)

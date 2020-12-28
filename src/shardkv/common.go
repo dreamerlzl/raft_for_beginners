@@ -29,6 +29,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Ver       int
 	ClerkId   int64
 	RequestId int64
 }
@@ -63,6 +64,14 @@ type ShardInfo struct {
 type PullReply struct {
 	Data ShardInfo
 	Err  Err
+}
+
+func lastRequestCopy(data map[int64]map[int64]bool) map[int64]map[int64]bool {
+	r := make(map[int64]map[int64]bool)
+	for k, v := range data {
+		r[k] = v
+	}
+	return r
 }
 
 func shardCopy(data map[string]string) map[string]string {
