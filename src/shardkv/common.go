@@ -16,6 +16,7 @@ const (
 	ErrWrongLeader Err = "ErrWrongLeader"
 	ErrDuplicate   Err = "ErrDuplicate"
 	ErrLagConfig   Err = "ErrLagConfig"
+	ErrTimeout     Err = "ErrTimeout"
 )
 
 type Err string
@@ -68,8 +69,11 @@ type PullReply struct {
 
 func lastRequestCopy(data map[int64]map[int64]bool) map[int64]map[int64]bool {
 	r := make(map[int64]map[int64]bool)
-	for k, v := range data {
-		r[k] = v
+	for ck, rq2b := range data {
+		r[ck] = make(map[int64]bool)
+		for rq, b := range rq2b {
+			r[ck][rq] = b
+		}
 	}
 	return r
 }

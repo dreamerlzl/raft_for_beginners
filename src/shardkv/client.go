@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"log"
 	"math/big"
+	"sync"
 	"time"
 
 	"../labrpc"
@@ -45,7 +46,9 @@ type Clerk struct {
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
 
-	clerkId int64
+	clerkId    int64
+	lastLeader map[int]int
+	mu         sync.Mutex // for sync lastLeader
 }
 
 //
@@ -64,6 +67,7 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	// You'll have to add code here.
 	ck.clerkId = nrand()
 	ck.config = ck.sm.Query(-1)
+	ck.lastLeader = make(map[int]int)
 	return ck
 }
 
@@ -83,20 +87,35 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		ck.mu.Lock()
+		if _, ok := ck.lastLeader[gid]; !ok {
+			ck.lastLeader[gid] = 0
+		}
+		si := ck.lastLeader[gid]
+		ck.mu.Unlock()
 		log.Printf("[ck %d][get] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
+			num := len(servers)
+			for j := 0; j < num; {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.mu.Lock()
+					ck.lastLeader[gid] = si
+					ck.mu.Unlock()
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					ck.mu.Lock()
+					ck.lastLeader[gid] = si
+					ck.mu.Unlock()
 					log.Printf("[ck %d][get] errwronggroup: shard %d for group %d", ck.clerkId, shard, gid)
 					break
 				}
+				j++
+				si = (si + 1) % num
 				// ... not ok, or ErrWrongLeader
 			}
 		}
@@ -104,8 +123,6 @@ func (ck *Clerk) Get(key string) string {
 		// ask master for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 //
@@ -124,9 +141,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		var si int
+		ck.mu.Lock()
+		if _, ok := ck.lastLeader[gid]; !ok {
+			ck.lastLeader[gid] = 0
+			si = ck.lastLeader[gid]
+		}
+		ck.mu.Unlock()
 		log.Printf("[ck %d][pa] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, key, shard, gid, ck.config.Num, ck.config.Shards)
+		var nextConfig bool
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
+			num := len(servers)
+			for j := 0; j < num; {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				args.Ver = ck.config.Num
@@ -134,19 +160,34 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok {
 					switch reply.Err {
 					case OK:
+						ck.mu.Lock()
+						ck.lastLeader[gid] = si
+						ck.mu.Unlock()
 						log.Printf("[ck %d][pa] finish %s %s %s at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						return
 					case ErrDuplicate:
+						ck.mu.Lock()
+						ck.lastLeader[gid] = si
+						ck.mu.Unlock()
 						log.Printf("[ck %d][pa] %s %s %s duplicate request at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						return
 					case ErrWrongGroup:
+						nextConfig = true
 						log.Printf("[ck %d][pa] %s %s %s wrong group at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
 						break
 					case ErrLagConfig:
 						time.Sleep(time.Millisecond * waitLagReplicaTime)
 					default:
+						j++
+						si = (si + 1) % num
 						log.Printf("[ck %d][pa] %s %s %s err: %v at %d, %s", ck.clerkId, op, key, value, reply.Err, gid, servers[si])
 					}
+					if nextConfig {
+						break
+					}
+				} else {
+					j++
+					si = (si + 1) % num
 				}
 				// ... not ok, or ErrWrongLeader
 			}

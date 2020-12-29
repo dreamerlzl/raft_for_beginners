@@ -18,14 +18,11 @@ import (
 
 const Debug = true
 const (
-	checkLeaderPeriod   = 20
-	checkSnapshotPeriod = 150
-	rpcTimeout          = 100
+	checkSnapshotPeriod = 300
 	requestTimeout      = 200
 	opChannelBufferSize = 10
-	maxGetShardTime     = 100
-	waitLagReplicaTime  = 100
-	retryPullTime       = 50
+	waitLagReplicaTime  = 300
+	retryPullTime       = 100
 )
 const logLevel = logrus.DebugLevel
 const ratio float32 = 0.90 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
@@ -77,7 +74,7 @@ type Put struct {
 }
 
 func (p Put) sop2string() string {
-	return fmt.Sprintf("put %s %s", p.key, p.value)
+	return fmt.Sprintf("put %s %s, v %d", p.key, p.value, p.ver)
 }
 
 type Append struct {
@@ -88,7 +85,7 @@ type Append struct {
 }
 
 func (a Append) sop2string() string {
-	return fmt.Sprintf("append %s %s", a.key, a.value)
+	return fmt.Sprintf("append %s %s, v %d", a.key, a.value, a.ver)
 }
 
 type Abandon struct {
@@ -121,6 +118,7 @@ type UpdateShard struct {
 	ver       int
 	shardinfo ShardInfo
 	changed   bool
+	result    chan bool
 }
 
 func (u UpdateShard) sop2string() string {
@@ -178,7 +176,8 @@ type ShardKV struct {
 	lastRequestId     []map[int64]map[int64]bool // ClerkId -> last finished RequestId
 	applyIndex        int
 	shardOp           map[int]chan ShardOp
-	mu2               sync.Mutex //to avoid concurrent hashmap write
+	mu2               sync.Mutex //to avoid concurrent hashmap write of kv.shardOp and kv.lastLeader
+	lastLeader        map[int]int
 	// to ensure that when the leader fails during a reconfig,
 	// the new leader can retry the reconfig
 	toGet      map[int]int
@@ -218,6 +217,9 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			var killed bool
 			lastConfig := kv.configs[sop.ver-1]
 			gid := lastConfig.Shards[me]
+			if gid < 0 {
+				gid = -gid
+			}
 			servers := lastConfig.Groups[gid]
 			if gid != kv.gid {
 				shardinfo, killed = kv.pullFrom(gid, me, sop.ver, servers)
@@ -255,6 +257,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					if sop.ver > kv.ver[me]+1 {
 						kv.DPrintf("lagging for %d", kv.ver[me]+1)
 					}
+					kv.DPrintf("begins to pull shard %d for v %d", me, sop.ver)
 					pullChan <- sop
 				}
 			} else {
@@ -274,20 +277,20 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			}
 		case Put:
 			sop := op.(Put)
-			if !kv.valid[me] {
-				sop.result <- ErrWrongGroup
-			} else if sop.ver > kv.ver[me] {
+			if sop.ver > kv.ver[me] {
 				sop.result <- ErrLagConfig
+			} else if !kv.valid[me] {
+				sop.result <- ErrWrongGroup
 			} else {
 				kv.data[me][sop.key] = sop.value
 				sop.result <- OK
 			}
 		case Append:
 			sop := op.(Append)
-			if !kv.valid[me] {
-				sop.result <- ErrWrongGroup
-			} else if sop.ver > kv.ver[me] {
+			if sop.ver > kv.ver[me] {
 				sop.result <- ErrLagConfig
+			} else if !kv.valid[me] {
+				sop.result <- ErrWrongGroup
 			} else {
 				if _, ok := kv.data[me][sop.key]; !ok {
 					sop.result <- ErrNoKey
@@ -334,7 +337,13 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			} else {
 				copy := shardCopy(kv.data[me])
 				sop.result <- copy
-				kv.valid[me] = false // ownership transfer!
+				if sop.ver == kv.ver[me]+1 {
+					kv.ver[me] = sop.ver
+					kv.valid[me] = false // ownership transfer!
+					kv.DPrintf("transfers shard %d to %d for v %d!", me, sop.from, sop.ver)
+				} else {
+					kv.DPrintf("gives meaningless shard %d to %d for v %d", me, sop.from, sop.ver)
+				}
 			}
 		case UpdateShard:
 			sop := op.(UpdateShard)
@@ -346,16 +355,18 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				kv.ver[me] = sop.ver
 				if sop.changed {
 					// kv.lock("starts to update shard %d v %d from %v to %v\nlastRequestId: %v",
-					// 	me, kv.ver[me], kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
+					// 	me, sop.ver, kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
 					kv.data[me] = shardCopy(sop.shardinfo.Data)
 					kv.lastRequestId[me] = lastRequestCopy(sop.shardinfo.LastRequestId)
 					// kv.unlock("finish update shard %d v %d from %v to %v\nlastRequestId: %v",
-					// 	me, kv.ver[me], kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
+					// 	me, sop.ver, kv.data[me], sop.shardinfo.Data, sop.shardinfo.LastRequestId)
 				}
 				kv.valid[me] = true
+				kv.DPrintf("shard %d, v %d: becomes valid", me, kv.ver[me])
 			} else {
 				kv.DPrintf("notices stale update shard %v", sop.ver)
 			}
+			sop.result <- true
 		default:
 			panic("Unexpected op type ")
 		}
@@ -369,25 +380,38 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (Shar
 		From:  kv.gid,
 	}
 	var reply PullReply
-
+	num := len(servers)
 	for {
-		for si := 0; si < len(servers); {
+		j := 0
+		kv.mu2.Lock()
+		si := kv.lastLeader[gid]
+		kv.mu2.Unlock()
+		for j < num {
 			srv := kv.make_end(servers[si])
 			ok := srv.Call("ShardKV.GetShard", &args, &reply)
 			if ok {
 				switch reply.Err {
+				case ErrTimeout:
+					kv.DPrintf("[pull s %d v %d from %d] timeout: %s", shard, ver, gid, servers[si])
+					si = (si + 1) % num
+					j++
 				case ErrWrongLeader:
 					kv.DPrintf("[pull s %d v %d from %d] wrong leader: %s", shard, ver, gid, servers[si])
-					si++
+					si = (si + 1) % num
+					j++
 				case ErrLagConfig:
 					kv.DPrintf("[pull s %d v %d from %d] lagging: %s", shard, ver, gid, servers[si])
 					time.Sleep(waitLagReplicaTime * time.Millisecond)
 				case OK:
+					kv.mu2.Lock()
+					kv.lastLeader[gid] = si
+					kv.mu2.Unlock()
 					kv.DPrintf("fetch s %d v %d from %d!", shard, ver, gid)
 					return reply.Data, false
 				}
 			} else {
-				si++
+				si = (si + 1) % num
+				j++
 			}
 		}
 		time.Sleep(time.Duration(retryPullTime) * time.Millisecond)
@@ -419,6 +443,7 @@ func (kv *ShardKV) GetShard(args *PullArgs, reply *PullReply) {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		reply.Err = ErrTimeout
 		kv.DPrintf("timeout for index %d, let %d get shard %d v %d", index, args.From, args.Shard, args.Ver)
 	case result := <-op.Result:
 		switch result.(type) {
@@ -456,6 +481,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		reply.Err = ErrTimeout
 		kv.DPrintf("timeout for index %d get %s, ck %d request %d", index, args.Key, args.ClerkId, args.RequestId)
 	case result := <-op.Result:
 		switch result.(type) {
@@ -493,6 +519,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		reply.Err = ErrTimeout
 		kv.DPrintf("timeout for index %d, %s %s %s, ck %d request %d", index, args.Op, args.Key, args.Value, args.ClerkId, args.RequestId)
 	case result := <-op.Result:
 		reply.Err = result.(Err)
@@ -569,7 +596,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	firstConfig := shardmaster.Config{}
 	for i := 0; i < len(firstConfig.Shards); i++ {
-		firstConfig.Shards[i] = kv.gid
+		firstConfig.Shards[i] = -kv.gid
 	}
 	firstConfig.Groups = make(map[int][]string)
 	firstConfig.Groups[kv.gid] = nil
@@ -588,6 +615,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyIndex = 0 // as raft, 1 is the first meaingful index
 	kv.shardOp = make(map[int]chan ShardOp)
 	kv.toGet = make(map[int]int)
+	kv.lastLeader = make(map[int]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.killedChan = make(chan bool)
@@ -601,13 +629,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// periodically check whether need to take a snapshot
 	go func() {
 		for {
-			if kv.rf.GetStateSize() >= int(ratio*float32(kv.maxraftstate)) {
+			size := kv.rf.GetStateSize()
+			if size >= int(ratio*float32(kv.maxraftstate)) {
 				kv.lock("start to encode snapshot")
 				snapshot := kv.encodeSnapshot()
 				applyIndex := kv.applyIndex
 				kv.unlock("finish copying snapshot with applyIndex %d", applyIndex)
 				kv.rf.TakeSnapshot(snapshot, applyIndex)
 				kv.DPrintf("finish encoding snapshot with applyIndex %d", applyIndex)
+			} else {
+				kv.DPrintf("snapshot size: %d/%d", size, kv.maxraftstate)
 			}
 			time.Sleep(time.Duration(checkSnapshotPeriod) * time.Millisecond)
 			if kv.killed() {
@@ -672,7 +703,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			case map[string]string:
 				op.Result <- ShardInfo{
 					Data:          result.(map[string]string),
-					LastRequestId: kv.lastRequestId[op.Shard],
+					LastRequestId: lastRequestCopy(kv.lastRequestId[op.Shard]),
 				}
 			case Err:
 				op.Result <- result
@@ -735,7 +766,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 	case "UpdateConfig":
 		config := shardmaster.CopyConfig(op.Config)
 		if config.Num <= kv.configIndex || kv.toGet[config.Num] > 0 {
-			kv.DPrintf("sees outdated config v %d", config.Num)
+			kv.DPrintf("sees outdated config v %d; config index: %d", config.Num, kv.configIndex)
 			return OK
 		}
 		kv.configs = append(kv.configs, config)
@@ -745,9 +776,9 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 				sop := Pull{
 					ver: config.Num,
 				}
-				kv.toGet[config.Num]++
 				kv.giveShardOp(i, sop)
-			} else {
+				kv.toGet[config.Num]++
+			} else if kv.configs[config.Num-1].Shards[i] != kv.gid {
 				// to advance the shard version
 				kv.giveShardOp(i, Abandon{ver: config.Num})
 			}
@@ -764,6 +795,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			ver:       op.Ver,
 			shardinfo: op.ShardInfo,
 			changed:   op.Changed,
+			result:    make(chan bool),
 		}
 		kv.giveShardOp(op.Shard, sop)
 		kv.toGet[op.Ver]--
@@ -775,6 +807,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			kv.configIndex++
 			kv.DPrintf("successfully updates config from %d to %d", kv.configIndex-1, kv.configIndex)
 		}
+		<-sop.result
 	case "DelayedAbandon":
 		sop := Abandon{
 			ver: op.Ver,
@@ -805,6 +838,7 @@ func (kv *ShardKV) pollConfig() {
 				op := Op{
 					Type:   "UpdateConfig",
 					Config: config,
+					Uid:    kv.uid,
 				}
 				index, _, isLeader := kv.rf.Start(op)
 				if isLeader {
@@ -883,7 +917,7 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		kv.ver = ver
 		kv.valid = valid
 		kv.DPrintf("loads config: %v, \ndata: %v", kv.configs[configIndex], kv.data)
-		kv.unlock("load snapshot with applyIndex: %d", kv.applyIndex)
+		kv.unlock("load snapshot with applyIndex: %d, configIndex: %d", kv.applyIndex, kv.configIndex)
 	}
 }
 
