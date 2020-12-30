@@ -19,7 +19,7 @@ import (
 const Debug = true
 const (
 	checkSnapshotPeriod = 300
-	requestTimeout      = 200
+	requestTimeout      = 300
 	opChannelBufferSize = 10
 	waitLagReplicaTime  = 300
 	retryTime           = 300
@@ -181,6 +181,7 @@ type ShardKV struct {
 	shardOp           map[int]chan ShardOp
 	updateChan        []chan int
 	mu2               sync.Mutex //to avoid concurrent hashmap write of kv.shardOp and kv.lastLeader
+	mu3               sync.Mutex // for sync lastValid
 	lastLeader        map[int]int
 	// to ensure that when the leader fails during a reconfig,
 	// the new leader can retry the reconfig
@@ -217,7 +218,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	go func(sops chan Pull) {
 		for sop := range sops {
 			var shardinfo ShardInfo
-			var killed bool
+			var status PullStatus
 			lastConfig := kv.configs[sop.ver-1]
 			gid := lastConfig.Shards[me]
 			servers := lastConfig.Groups[gid]
@@ -229,9 +230,12 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					_, isLeader := kv.rf.GetState()
 					if isLeader {
 						kv.DPrintf("starts to pull shard %d v %d from %d: %v", me, sop.ver, gid, kv.configs[sop.ver-1].Shards)
-						shardinfo, killed = kv.pullFrom(gid, me, sop.ver, servers)
-						if killed {
-							return
+						shardinfo, status = kv.pullFrom(gid, me, sop.ver, servers)
+						if status == Killed {
+							break
+						} else if status == Stopped {
+							<-kv.updateChan[me]
+							break
 						}
 					}
 				} else {
@@ -244,7 +248,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					Ver:       sop.ver,
 					Shard:     me,
 					From:      gid,
-					Me:        kv.me,
+					Uid:       kv.uid,
 					// the shard belongs to me in the last and the current version;
 					// no need to pull from another replica group
 					Changed: gid != kv.gid,
@@ -252,7 +256,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				index, _, isLeader := kv.rf.Start(op) // only leader would succeed
 				if isLeader {
 					kv.DPrintf("issues update shard %d, v %d at index %d", me, sop.ver, index)
-					kv.updateChan[me] <- sop.ver
+					// kv.updateChan[me] <- sop.ver
 				}
 
 				timer := time.NewTimer(time.Millisecond * time.Duration(retryPull))
@@ -284,6 +288,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	for {
 		op := <-ops
 		kv.DPrintf(fmt.Sprintf("shard %d, ver %d: ", me, kv.ver[me]) + op.sop2string())
+		kv.mu3.Lock()
 		switch op.(type) {
 		case Terminate:
 			close(pullChan)
@@ -410,6 +415,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		default:
 			panic("Unexpected op type ")
 		}
+		kv.mu3.Unlock()
 	}
 }
 
@@ -459,7 +465,15 @@ func (kv *ShardKV) finishUpdate(providerGid int, gid int, shard int, ver int, se
 	}
 }
 
-func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (ShardInfo, bool) {
+type PullStatus int
+
+const (
+	Done    PullStatus = 0
+	Killed  PullStatus = 1
+	Stopped PullStatus = 2
+)
+
+func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (ShardInfo, PullStatus) {
 	args := PullArgs{
 		Shard: shard,
 		Ver:   ver,
@@ -493,7 +507,7 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (Shar
 					kv.lastLeader[gid] = si
 					kv.mu2.Unlock()
 					kv.DPrintf("fetch s %d v %d from %d!", shard, ver, gid)
-					return reply.Data, false
+					return reply.Data, Done
 				}
 			} else {
 				si = (si + 1) % num
@@ -502,8 +516,15 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (Shar
 		}
 		time.Sleep(time.Duration(retryTime) * time.Millisecond)
 		if kv.killed() {
-			return ShardInfo{}, true
+			return ShardInfo{}, Killed
 		}
+		kv.mu3.Lock()
+		if kv.lastValid[shard] >= ver {
+			kv.DPrintf("stops pulling shard %d v %d from %d", shard, ver, gid)
+			kv.mu3.Unlock()
+			return ShardInfo{}, Stopped
+		}
+		kv.mu3.Unlock()
 		kv.DPrintf("retry pulling shard %d version %d from %d...", shard, ver, gid)
 	}
 }
@@ -525,7 +546,11 @@ func (kv *ShardKV) GetShard(args *PullArgs, reply *PullReply) {
 	}
 	kv.DPrintf("notices that %d wants to get shard %d for %v at index %d", args.From, args.Shard, args.Ver, index)
 
-	timer := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+	timeout := kv.applyIndex - index
+	if timeout < requestTimeout {
+		timeout = requestTimeout
+	}
+	timer := time.NewTimer(time.Millisecond * time.Duration(timeout))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -564,7 +589,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.DPrintf("issues index %d, %s", index, op2string(op))
 
-	timer := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+	timeout := kv.applyIndex - index
+	if timeout < requestTimeout {
+		timeout = requestTimeout
+	}
+	timer := time.NewTimer(time.Millisecond * time.Duration(timeout))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -601,8 +630,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.DPrintf("issues index %d, %s", index, op2string(op))
+	timeout := kv.applyIndex - index
+	if timeout < requestTimeout {
+		timeout = requestTimeout
+	}
 
-	timer := time.NewTimer(time.Millisecond * time.Duration(requestTimeout))
+	timer := time.NewTimer(time.Millisecond * time.Duration(timeout))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -913,10 +946,12 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			kv.DPrintf("successfully updates config from %d to %d", kv.configIndex-1, kv.configIndex)
 		}
 	case "UpdateShard":
-		toCheck = true
-		if op.Me != kv.me {
-			kv.updateChan[op.Shard] <- op.Ver
+		if op.Ver < kv.configIndex {
+			kv.DPrintf("skip apply played update shard %d v %d", op.Shard, op.Ver)
+			break
 		}
+		toCheck = true
+		kv.updateChan[op.Shard] <- op.Ver
 		sop := UpdateShard{
 			ver:         op.Ver,
 			shardinfo:   op.ShardInfo,
