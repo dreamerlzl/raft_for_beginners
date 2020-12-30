@@ -93,13 +93,14 @@ func (ck *Clerk) Get(key string) string {
 		}
 		si := ck.lastLeader[gid]
 		ck.mu.Unlock()
-		log.Printf("[ck %d][get] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, key, shard, gid, ck.config.Num, ck.config.Shards)
+		log.Printf("[ck %d][get %d] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, args.RequestId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			num := len(servers)
 			for j := 0; j < num; {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
+				args.Ver = ck.config.Num
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					ck.mu.Lock()
@@ -148,7 +149,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			si = ck.lastLeader[gid]
 		}
 		ck.mu.Unlock()
-		log.Printf("[ck %d][pa] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, key, shard, gid, ck.config.Num, ck.config.Shards)
+		log.Printf("[ck %d][pa %d] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, args.RequestId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		var nextConfig bool
 		if servers, ok := ck.config.Groups[gid]; ok {
 			num := len(servers)

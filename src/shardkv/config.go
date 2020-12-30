@@ -1,21 +1,26 @@
 package shardkv
 
-import "../shardmaster"
-import "../labrpc"
-import "testing"
-import "os"
+import (
+	"log"
+	"os"
+	"testing"
 
-// import "log"
-import crand "crypto/rand"
-import "math/big"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "../raft"
-import "strconv"
-import "fmt"
-import "time"
+	"../labrpc"
+	"../shardmaster"
+
+	// import "log"
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"math/rand"
+	"runtime"
+	"strconv"
+	"sync"
+	"time"
+
+	"../raft"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -77,7 +82,9 @@ func (cfg *config) checkTimeout() {
 }
 
 func (cfg *config) cleanup() {
+	log.Printf("ngroups: %d", cfg.ngroups)
 	for gi := 0; gi < cfg.ngroups; gi++ {
+		log.Printf("kill gid %d", gi)
 		cfg.ShutdownGroup(gi)
 	}
 	cfg.net.Cleanup()
@@ -151,6 +158,7 @@ func (cfg *config) deleteClient(ck *Clerk) {
 
 // Shutdown i'th server of gi'th group, by isolating it
 func (cfg *config) ShutdownServer(gi int, i int) {
+	log.Printf("kill gid %d, kv %d", gi, i)
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 

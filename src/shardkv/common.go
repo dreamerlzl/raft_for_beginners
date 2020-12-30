@@ -41,6 +41,7 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
+	Ver int
 	// You'll have to add definitions here.
 	ClerkId   int64
 	RequestId int64
@@ -65,6 +66,16 @@ type ShardInfo struct {
 type PullReply struct {
 	Data ShardInfo
 	Err  Err
+}
+
+type InfoAbandonArgs struct {
+	Shard int
+	From  int
+	Ver   int
+}
+
+type InfoAbandonReply struct {
+	Err Err
 }
 
 func lastRequestCopy(data map[int64]map[int64]bool) map[int64]map[int64]bool {
