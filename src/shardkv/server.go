@@ -381,12 +381,16 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		case UpdateShard:
 			sop := op.(UpdateShard)
 			if sop.ver == kv.ver[me]+1 {
-				kv.DPrintf("waiting for receiving update shard %d v %d", me, sop.ver)
-				kv.updateChan[me] <- sop.ver
 				if sop.changed {
+					if sop.shardinfo.Data == nil {
+						kv.DPrintf("shard %d v %d rare case: first no leader pull data, but then one issues this log entry successfully", me, sop.ver)
+						break // skip this update
+					}
 					kv.data[me] = shardCopy(sop.shardinfo.Data)
 					kv.lastRequestId[me] = lastRequestCopy(sop.shardinfo.LastRequestId)
 				}
+				kv.DPrintf("waiting for receiving update shard %d v %d", me, sop.ver)
+				kv.updateChan[me] <- sop.ver
 				kv.ver[me] = sop.ver
 				kv.lastValid[me] = sop.ver
 				kv.DPrintf("shard %d, v %d: becomes valid", me, kv.ver[me])
@@ -943,12 +947,10 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		var lastRequestId []map[int64]map[int64]bool
 		var applyIndex int
 		var lastPollConfigNum int
-		var configIndex int
 		var configs []shardmaster.Config
 		var ver []int
 		var lastValid []int
 		if d.Decode(&applyIndex) != nil ||
-			d.Decode(&configIndex) != nil ||
 			d.Decode(&lastPollConfigNum) != nil ||
 			d.Decode(&configs) != nil ||
 			d.Decode(&data) != nil ||
