@@ -186,9 +186,10 @@ type ShardKV struct {
 	toGet             map[int]int
 	// to ensure that when the leader fails during a reconfig,
 	// the new leader can retry the reconfig
-	dead       int32
-	killedChan chan bool
-	uid        int64
+	dead          int32
+	killedChan    chan bool
+	uid           int64
+	lastSeeConfig int
 }
 
 func (kv *ShardKV) updateConfig() {
@@ -199,6 +200,9 @@ func (kv *ShardKV) updateConfig() {
 		kv.lastUpdatedConfig = i
 	}
 	kv.lastPollConfigNum = kv.lastUpdatedConfig
+	if kv.lastUpdatedConfig > kv.lastSeeConfig {
+		kv.lastSeeConfig = kv.lastUpdatedConfig
+	}
 	kv.DPrintf("finish update config %d", kv.lastUpdatedConfig)
 }
 
@@ -302,9 +306,11 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	for {
 		op := <-ops
 		kv.DPrintf(fmt.Sprintf("shard %d, ver %d: ", me, kv.ver[me]) + op.sop2string())
+		kv.mu3.Lock()
 		switch op.(type) {
 		case Terminate:
 			close(pullChan)
+			kv.mu3.Unlock()
 			return
 		case Pull:
 			sop := op.(Pull)
@@ -409,9 +415,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				}
 				kv.DPrintf("waiting for receiving update shard %d v %d", me, sop.ver)
 				kv.updateChan[me] <- sop.ver
-				kv.ver[me] = sop.ver
-				kv.lastValid[me] = sop.ver
-				kv.mu3.Lock()
 				if _, ok := kv.toGet[sop.ver]; ok {
 					kv.toGet[sop.ver]--
 					kv.DPrintf("to get %d for config %d", kv.toGet[sop.ver], sop.ver)
@@ -419,9 +422,11 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 						kv.updateConfig()
 					}
 				} else {
-					kv.DPrintf("shard %d, v %d: sees unfinished update v %d from last instance", me, kv.ver[me], sop.ver)
+					kv.DPrintf("shard %d, v %d: toGet of %d is not initialized; pass", me, kv.ver[me], sop.ver)
+					panic("unexpected update shard")
 				}
-				kv.mu3.Unlock()
+				kv.ver[me] = sop.ver
+				kv.lastValid[me] = sop.ver
 				kv.DPrintf("shard %d, v %d: becomes valid", me, kv.ver[me])
 			} else if sop.ver > kv.ver[me]+1 {
 				kv.DPrintf("shard %d update want %d, given %d", me, kv.ver[me]+1, sop.ver)
@@ -433,6 +438,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		default:
 			panic("Unexpected op type ")
 		}
+		kv.mu3.Unlock()
 	}
 }
 
@@ -865,10 +871,15 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 		config := shardmaster.CopyConfig(op.Config)
 		kv.mu3.Lock()
 		defer kv.mu3.Unlock()
-		if _, ok := kv.toGet[config.Num]; config.Num <= kv.lastUpdatedConfig || ok {
+		if config.Num <= kv.lastUpdatedConfig || config.Num == kv.lastSeeConfig {
 			kv.DPrintf("sees outdated config v %d; last finished config: %d", config.Num, kv.lastUpdatedConfig)
 			return OK
 		}
+		if config.Num > kv.lastSeeConfig+1 {
+			kv.DPrintf("realizes config %d is processed but not completed", kv.lastUpdatedConfig+1)
+			return ErrLagConfig
+		}
+		kv.lastSeeConfig = config.Num
 		kv.toGet[config.Num] = 0
 		if config.Num > len(kv.configs)-1 {
 			kv.configs = append(kv.configs, config)
@@ -920,6 +931,7 @@ func (kv *ShardKV) pollConfig() {
 		// for restart with snapshot; maybe killed during updating to a new config
 		kv.lastPollConfigNum = kv.lastUpdatedConfig
 	}
+	kv.DPrintf("begins polling with %d", kv.lastPollConfigNum)
 	for {
 		_, isLeader := kv.rf.GetState()
 		// only issue update when the configuration changes
@@ -953,6 +965,7 @@ func (kv *ShardKV) pollConfig() {
 func (kv *ShardKV) encodeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	kv.mu3.Lock()
 	if e.Encode(kv.lastUpdatedConfig) != nil {
 		panic("fail to encode kv.lastUpdatedConfig")
 	}
@@ -977,6 +990,10 @@ func (kv *ShardKV) encodeSnapshot() []byte {
 	if e.Encode(kv.lastValid) != nil {
 		panic("fail to encode kv.valid")
 	}
+	if e.Encode(kv.toGet) != nil {
+		panic("fail to encode kv.toGet!")
+	}
+	kv.mu3.Unlock()
 	return w.Bytes()
 }
 
@@ -994,6 +1011,7 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		var configs []shardmaster.Config
 		var ver []int
 		var lastValid []int
+		var toGet map[int]int
 		if d.Decode(&lastUpdatedConfig) != nil ||
 			d.Decode(&applyIndex) != nil ||
 			d.Decode(&lastPollConfigNum) != nil ||
@@ -1001,11 +1019,15 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 			d.Decode(&data) != nil ||
 			d.Decode(&lastRequestId) != nil ||
 			d.Decode(&ver) != nil ||
-			d.Decode(&lastValid) != nil {
+			d.Decode(&lastValid) != nil ||
+			d.Decode(&toGet) != nil {
 			kv.DPrintf("fails to read snapshot!")
 			panic("fail to read snapshot")
 		}
 		kv.lastUpdatedConfig = lastUpdatedConfig
+		if lastUpdatedConfig > kv.lastSeeConfig {
+			kv.lastSeeConfig = lastUpdatedConfig
+		}
 		kv.applyIndex = applyIndex
 		kv.data = data
 		kv.lastRequestId = lastRequestId
@@ -1013,6 +1035,7 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		kv.lastPollConfigNum = lastPollConfigNum
 		kv.ver = ver
 		kv.lastValid = lastValid
+		kv.toGet = toGet
 		// kv.DPrintf("loads config: %v, \ndata: %v", kv.configs, kv.data)
 		kv.unlock("load snapshot with applyIndex: %d, last updated config: %d", kv.applyIndex, kv.lastUpdatedConfig)
 	}
