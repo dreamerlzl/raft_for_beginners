@@ -85,8 +85,10 @@ func (rf *Raft) becomeLeader() {
 		}
 	}
 	// initial heartbeat
-	go rf.bcastAppendEntries()
-	go rf.sendHeartbeat()
+	go func() {
+		rf.bcastAppendEntries()
+		go rf.sendHeartbeat()
+	}()
 	logrus.Infof("[%d] becomes a leader with term %d!", rf.me, rf.currentTerm)
 }
 
