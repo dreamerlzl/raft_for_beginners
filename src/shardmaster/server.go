@@ -3,6 +3,7 @@ package shardmaster
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -12,7 +13,8 @@ import (
 	"../raft"
 )
 
-const debug = 0
+const smDebug = false
+const rfDebug = true
 const (
 	checkLeaderPeriod   = 50
 	checkSnapshotPeriod = 150
@@ -37,7 +39,9 @@ type ShardMaster struct {
 }
 
 func (sm *ShardMaster) DPrintf(msg string, f ...interface{}) {
-	DPrintf(fmt.Sprintf("[sm %d] %s", sm.me, msg), f...)
+	if smDebug {
+		log.Printf("[sm %d] %s", sm.me, fmt.Sprintf(msg, f...))
+	}
 }
 
 func (sm *ShardMaster) lock(msg string, f ...interface{}) {
@@ -484,6 +488,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
+	if rfDebug {
+		sm.rf.Log()
+	}
 
 	// Your code here.
 	sm.lastNum = 0

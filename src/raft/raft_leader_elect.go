@@ -2,8 +2,6 @@ package raft
 
 import (
 	"sync"
-
-	logrus "github.com/sirupsen/logrus"
 )
 
 //
@@ -43,7 +41,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if turnToFollower || (rf.currentTerm == args.SenderTerm && rf.votedFor == -1) {
 		lastTerm := rf.getLogEntry(rf.lastIndex).EntryTerm
 		if turnToFollower {
-			logrus.Infof("[%d] (term %d) receives request vote from %d with larger term %d", rf.me, rf.currentTerm, args.CandidateId, args.SenderTerm)
+			rf.Infof("(term %d) receives request vote from %d with larger term %d", rf.currentTerm, args.CandidateId, args.SenderTerm)
 			rf.updateCurrentTerm(args.SenderTerm) // must update here
 		}
 		if args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= rf.lastIndex) {
@@ -53,24 +51,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 			defer rf.resetElectionTimer()
 			reply.ReceiverVote = true
-			logrus.Debugf("[%d] votes for %d in term %d (original votedFor %d)", rf.me, args.CandidateId, args.SenderTerm, rf.votedFor)
+			rf.Debugf("votes for %d in term %d (original votedFor %d)", args.CandidateId, args.SenderTerm, rf.votedFor)
 			rf.votedFor = args.CandidateId
 			rf.persist()
 		} else {
 			reply.NotUpToDate = true
-			logrus.Debugf("[%d]'s log is not up-to-date as %d's", args.CandidateId, rf.me)
+			rf.Debugf("[%d]'s log is not up-to-date as mine", args.CandidateId)
 		}
 		if turnToFollower {
 			rf.killOldRole()
 		}
 	} else {
-		logrus.Debugf("[%d](term %d) rejects %d(term %d)",
-			rf.me, rf.currentTerm, args.CandidateId, args.SenderTerm)
+		rf.Debugf("(term %d) rejects %d(term %d)", rf.currentTerm, args.CandidateId, args.SenderTerm)
 	}
 }
 
 func (rf *Raft) becomeFollower() {
-	logrus.Infof("[%d] becomes a follower with term %d!", rf.me, rf.currentTerm)
+	rf.Infof("becomes a follower with term %d!", rf.currentTerm)
 	rf.state = follower
 	go rf.checkHeartbeat()
 }
@@ -89,7 +86,7 @@ func (rf *Raft) becomeLeader() {
 		rf.bcastAppendEntries()
 		go rf.sendHeartbeat()
 	}()
-	logrus.Infof("[%d] becomes a leader with term %d!", rf.me, rf.currentTerm)
+	rf.Infof("becomes a leader with term %d!", rf.currentTerm)
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -100,7 +97,7 @@ func (rf *Raft) becomeCandidate() {
 			select {
 			case kill := <-rf.killedChan[follower]:
 				if kill {
-					logrus.Infof("[%d] receives kill signal", rf.me)
+					rf.Infof("receives kill signal")
 					return
 				} else {
 					rf.downgrade = true
@@ -113,18 +110,18 @@ func (rf *Raft) becomeCandidate() {
 	}()
 	var localLock sync.Mutex
 	for !rf.killed() {
-		logrus.Debugf("[%d] waiting for lock", rf.me)
+		rf.Debugf("waiting for lock in becomeCandidate")
 		rf.mu.Lock()
 		close(stopListen)
 		if rf.downgrade {
 			rf.downgrade = false
-			logrus.Warnf("[%d] hears from new leader during transition to candidate", rf.me)
+			rf.Warnf("hears from new leader during transition to candidate")
 			rf.becomeFollower()
 			rf.mu.Unlock()
 			return
 		}
 		if rf.stale { // if log is not up-to-date as a majority, doomed to fail
-			logrus.Warnf("[%d] becomes a follower because its log is stale", rf.me)
+			rf.Warnf("becomes a follower because its log is stale")
 			rf.becomeFollower()
 			rf.mu.Unlock()
 			return
@@ -132,7 +129,7 @@ func (rf *Raft) becomeCandidate() {
 		rf.state = candidate
 		rf.votedFor = rf.me
 		rf.currentTerm = rf.currentTerm + 1
-		logrus.Infof("[%d] becomes a candidate with term: %d", rf.me, rf.currentTerm)
+		rf.Infof("becomes a candidate with term: %d", rf.currentTerm)
 		rf.resetElectionTimer()
 		args := &RequestVoteArgs{CandidateId: rf.me, SenderTerm: rf.currentTerm}
 		args.LastLogIndex = rf.lastIndex
@@ -157,28 +154,28 @@ func (rf *Raft) becomeCandidate() {
 					if ok {
 						if reply.ReceiverVote {
 							vote++
-							logrus.Debugf("[%d] vote count: %d", rf.me, vote)
+							rf.Debugf("vote count: %d", vote)
 							if 2*vote > numPeers {
 								finish = true
 								rf.mu.Lock()
 								if rf.state == candidate {
 									rf.killedChan[candidate] <- true
 									rf.becomeLeader()
-									logrus.Infof("[%d] succeeds in election", rf.me)
+									rf.Infof("succeeds in election")
 									rf.mu.Unlock()
 									return
 								}
 								rf.mu.Unlock()
 							}
 						} else if reply.ReceiverTerm > args.SenderTerm {
-							logrus.Debugf("[%d]'s term %d is < %d's term %d", rf.me, args.SenderTerm, server, reply.ReceiverTerm)
+							rf.Debugf("'s term %d is < %d's term %d", args.SenderTerm, server, reply.ReceiverTerm)
 							finish = true
 							rf.mu.Lock()
 							if rf.state == candidate {
 								rf.killedChan[candidate] <- true
 								rf.updateCurrentTerm(reply.ReceiverTerm)
 								rf.becomeFollower()
-								logrus.Infof("[%d] turns to a follower", rf.me)
+								rf.Infof("turns to a follower")
 								rf.mu.Unlock()
 								return
 							}
@@ -194,14 +191,14 @@ func (rf *Raft) becomeCandidate() {
 									rf.stale = true
 									rf.becomeFollower()
 									rf.mu.Unlock()
-									logrus.Infof("[%d] turns to a follower cause its log is stale", rf.me)
+									rf.Infof("turns to a follower cause its log is stale")
 									return
 								}
 								rf.mu.Unlock()
 							}
 						}
 					} else {
-						// logrus.Debugf("[%d] failed to contact %d for vote", rf.me, server)
+						// rf.Debugf("failed to contact %d for vote", server)
 					}
 				}(i)
 			}
@@ -213,7 +210,7 @@ func (rf *Raft) becomeCandidate() {
 			case <-localTimer.C:
 				localLock.Lock()
 				if finish {
-					logrus.Infof("[%d] timeout but find that it already finished election", rf.me)
+					rf.Infof("timeout but find that it already finished election")
 					localLock.Unlock()
 					return
 				}
@@ -225,7 +222,7 @@ func (rf *Raft) becomeCandidate() {
 					rf.state = follower
 					go rf.becomeCandidate()
 					rf.mu.Unlock()
-					logrus.Infof("[%d] retries to be a candidate", rf.me)
+					rf.Infof("retries to be a candidate")
 					return
 				}
 				rf.mu.Unlock()
@@ -233,7 +230,7 @@ func (rf *Raft) becomeCandidate() {
 		}()
 
 		<-rf.killedChan[candidate]
-		logrus.Infof("[%d] ends being a candidate", rf.me)
+		rf.Infof("ends being a candidate")
 		return
 	}
 }
@@ -252,26 +249,26 @@ func (rf *Raft) updateCurrentTerm(compareTerm int) {
 	case candidate:
 		role = "candidate"
 	}
-	logrus.Infof("[%d] updates term to %d; original role: %s", rf.me, compareTerm, role)
+	rf.Infof("updates term to %d; original role: %s", compareTerm, role)
 }
 
 // become a candidate if not receiving a heartbeat from the leader for rf.electionTimeout
 func (rf *Raft) checkHeartbeat() {
-	logrus.Infof("[%d] starts to check heartbeat", rf.me)
+	rf.Infof("starts to check heartbeat")
 	rf.resetElectionTimer()
-	defer logrus.Infof("[%d] ends checking heartbeat", rf.me)
+	defer rf.Infof("ends checking heartbeat")
 	for {
 		select {
 		case <-rf.electionTimer.C:
-			logrus.Infof("[%d] tries to be a candidate", rf.me)
+			rf.Infof("tries to be a candidate")
 			go rf.becomeCandidate()
 			return
 		case kill := <-rf.killedChan[follower]:
 			if kill {
-				logrus.Infof("[%d] receives kill signal", rf.me)
+				rf.Infof("receives kill signal")
 				return
 			} else {
-				logrus.Infof("[%d] continues to be a follower", rf.me)
+				rf.Infof("continues to be a follower")
 				rf.killReply <- true
 				continue
 			}
@@ -281,15 +278,15 @@ func (rf *Raft) checkHeartbeat() {
 
 // if myself becomes a leader then periodically(200ms) sends heartbeats to all peers
 func (rf *Raft) sendHeartbeat() {
-	logrus.Infof("[%d] starts to send heartbeats", rf.me)
+	rf.Infof("starts to send heartbeats")
 	rf.resetHeartbeatTimer()
-	defer logrus.Infof("[%d] terminates sending heartbeat", rf.me)
+	defer rf.Infof("terminates sending heartbeat")
 	for {
 		select {
 		case <-rf.heartbeatTimer.C:
 			go rf.bcastAppendEntries()
 		case <-rf.killedChan[leader]:
-			logrus.Infof("[%d] receives kill signal", rf.me)
+			rf.Infof("receives kill signal")
 			return
 		}
 	}
@@ -304,7 +301,7 @@ func (rf *Raft) killOldRole() {
 	case candidate:
 		rf.killedChan[candidate] <- true
 		rf.becomeFollower()
-		logrus.Warnf("[%d] downgrades to follower during transition", rf.me)
+		rf.Warnf("downgrades to follower during transition")
 	case leader:
 		rf.killedChan[leader] <- true
 		rf.becomeFollower()

@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -30,7 +31,7 @@ import (
 	"../labrpc"
 )
 
-var logLevel = logrus.WarnLevel
+var logLevel = logrus.DebugLevel
 var heartbeatPeriod = 50
 var electTimeoutBase = 250 // 250 - 500 ms for randomized election timeout
 var electTimeoutRange = 250
@@ -104,18 +105,47 @@ type Raft struct {
 	// leader only
 	nextIndex  []int
 	matchIndex []int
+
+	// for debug
+	debug bool
+}
+
+func (rf *Raft) Debugf(msg string, f ...interface{}) {
+	if rf.debug {
+		// log.Printf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+		logrus.Debugf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+	}
+}
+
+func (rf *Raft) Infof(msg string, f ...interface{}) {
+	if rf.debug {
+		// log.Printf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+		logrus.Infof("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+	}
+}
+
+func (rf *Raft) Warnf(msg string, f ...interface{}) {
+	if rf.debug {
+		// log.Printf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+		logrus.Warnf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+	}
+}
+
+func (rf *Raft) Errorf(msg string, f ...interface{}) {
+	if rf.debug {
+		// log.Printf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+		logrus.Warnf("[rf %d] %s", rf.me, fmt.Sprintf(msg, f...))
+	}
 }
 
 func (rf *Raft) lock(msg string, f ...interface{}) {
 	rf.mu.Lock()
-	// logrus.Infof("[%d]"+msg, kv.me)
-	logrus.Debugf(msg, f...)
+	rf.Debugf(msg, f...)
 }
 
 func (rf *Raft) unlock(msg string, f ...interface{}) {
-	logrus.Debugf(msg, f...)
+	rf.Debugf(msg, f...)
 	rf.mu.Unlock()
-	// logrus.Infof("[%d]"+msg, kv.me)
 }
 
 func (rf *Raft) newElectionTimer() *time.Timer {
@@ -132,7 +162,7 @@ func (rf *Raft) resetElectionTimer() {
 	}
 	newElectionTimeout := rand.Intn(electTimeoutBase) + electTimeoutRange
 	rf.electionTimer.Reset(time.Duration(newElectionTimeout) * time.Millisecond)
-	logrus.Debugf("[%d] resets election timer", rf.me)
+	rf.Debugf("resets election timer")
 }
 
 func (rf *Raft) newHeartbeatTimer() {
@@ -147,7 +177,7 @@ func (rf *Raft) resetHeartbeatTimer() {
 		}
 	}
 	rf.heartbeatTimer.Reset(time.Duration(heartbeatPeriod) * time.Millisecond)
-	logrus.Debugf("[%d] resets heartbeat timer", rf.me)
+	rf.Debugf("resets heartbeat timer")
 }
 
 func (rf *Raft) getLogEntry(index int) LogEntry {
@@ -156,7 +186,7 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 
 func (rf *Raft) getLogEntries(start, end int) []LogEntry {
 	if start < rf.lastIncludedIndex {
-		logrus.Errorf("[%d] lastIncludedIndex: %d start: %d end: %d", rf.me, rf.lastIncludedIndex, start, end)
+		rf.Errorf("lastIncludedIndex: %d start: %d end: %d", rf.lastIncludedIndex, start, end)
 		panic("index out of bound")
 	}
 	return rf.log[start-rf.lastIncludedIndex : end-rf.lastIncludedIndex]
@@ -257,7 +287,7 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&lastIncludedIndex) != nil ||
 		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&log) != nil {
-		logrus.Errorf("labgob decode error")
+		rf.Errorf("labgob decode error")
 	} else {
 		rf.log = log
 		rf.currentTerm = currentTerm
@@ -267,7 +297,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIndex = lastIncludedIndex + len(rf.log) - 1
 	}
 	rf.resetElectionTimer()
-	logrus.Warnf("[%d] restarts with term %d, lastIncludedIndex: %d!", rf.me, rf.currentTerm, rf.lastIncludedIndex)
+	rf.Warnf("restarts with term %d, lastIncludedIndex: %d!", rf.currentTerm, rf.lastIncludedIndex)
 }
 
 //
@@ -327,7 +357,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.lastIndex++
 		index = rf.lastIndex
 		rf.appendLogEntry(LogEntry{Command: command, EntryTerm: term})
-		logrus.Infof("[%d] start to propose entry{command: %v, term: %d} on index %d", rf.me, command, term, index)
+		rf.Infof("start to propose entry{command: %v, term: %d} on index %d", command, term, index)
 		rf.persist()
 		rf.mu.Unlock()
 		// rf.bcastAppendEntries()
@@ -352,7 +382,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	rf.killedChan[rf.state] <- true
-	logrus.Warnf("[%d] has been killed!", rf.me)
+	rf.Warnf("has been killed!")
 }
 
 func (rf *Raft) killed() bool {
@@ -408,7 +438,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for !rf.killed() {
 			time.Sleep(time.Duration(applyPeriod))
 			if rf.lastSent < rf.commitIndex {
-				rf.lock("[%d] starts to send applyMsg", rf.me)
+				rf.lock(" starts to send applyMsg")
 				rf.lastSent = MaxInt(rf.lastIncludedIndex, rf.lastSent)
 				num := rf.commitIndex - rf.lastSent
 				applyMsgs := make([]ApplyMsg, num)
@@ -420,10 +450,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						CommandValid: true,
 					}
 					applyMsgs[i] = applyMsg
-					logrus.Infof("[%d] sent applyMsg with index %d", rf.me, rf.lastSent)
+					rf.Infof("sent applyMsg with index %d", rf.lastSent)
 					// rf.applyCh <- applyMsg
 				}
-				rf.unlock("[%d] finished sending applyMsg", rf.me)
+				rf.unlock(" finished sending applyMsg")
 				for i := 0; i < num; i++ {
 					rf.applyCh <- applyMsgs[i]
 				}
@@ -433,4 +463,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// intially a follower
 	rf.becomeFollower()
 	return rf
+}
+
+func (rf *Raft) Log() {
+	rf.debug = true
 }

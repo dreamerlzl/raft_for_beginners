@@ -1,9 +1,5 @@
 package shardmaster
 
-import (
-	"log"
-)
-
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -23,12 +19,6 @@ import (
 
 // The number of shards.
 const NShards = 10
-
-func DPrintf(format string, a ...interface{}) {
-	if debug == 1 {
-		log.Printf(format, a...)
-	}
-}
 
 func Min(a, b int) int {
 	if a < b {

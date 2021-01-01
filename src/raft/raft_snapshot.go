@@ -4,7 +4,6 @@ import (
 	"bytes"
 
 	"../labgob"
-	logrus "github.com/sirupsen/logrus"
 )
 
 func (rf *Raft) GetStateSize() int {
@@ -13,10 +12,10 @@ func (rf *Raft) GetStateSize() int {
 
 func (rf *Raft) TakeSnapshot(snapshot []byte, lastApplied int) {
 	if rf.commitIndex > rf.lastIncludedIndex {
-		rf.lock("[%d] starts to take snapshot!", rf.me)
+		rf.lock(" starts to take snapshot!")
 		// only committed entries will be bundled as a snapshot
 		if lastApplied < rf.lastIncludedIndex {
-			rf.unlock("[%d] installs a snapshot with lastIncludedIndex %d when preparing to take one with %d", rf.me, rf.lastIncludedIndex, lastApplied)
+			rf.unlock(" installs a snapshot with lastIncludedIndex %d when preparing to take one with %d", rf.lastIncludedIndex, lastApplied)
 			return
 		}
 		rf.trimEntries(lastApplied)
@@ -34,7 +33,7 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastApplied int) {
 		e.Encode(rf.log)
 		data := w.Bytes()
 		rf.persister.SaveStateAndSnapshot(data, snapshot)
-		rf.unlock("[%d] finished taking snapshot with lastIncludedIndex %d", rf.me, rf.lastIncludedIndex)
+		rf.unlock(" finished taking snapshot with lastIncludedIndex %d", rf.lastIncludedIndex)
 	}
 }
 
@@ -60,7 +59,7 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) sendSnapshot(server int) {
 	for !rf.killed() {
-		rf.lock("[%d] starts to prepare snapshot to %d", rf.me, server)
+		rf.lock(" starts to prepare snapshot to %d", server)
 		args := InstallSnapshotArgs{
 			Data:             rf.GetSnapshot(),
 			LeaderId:         rf.me,
@@ -68,38 +67,38 @@ func (rf *Raft) sendSnapshot(server int) {
 			LastIncludeIndex: rf.lastIncludedIndex,
 			LastIncludeTerm:  rf.lastIncludedTerm,
 		}
-		rf.unlock("[%d] finishes preparing snapshot for %d with lastIncludedIndex: %d", rf.me, server, rf.lastIncludedIndex)
+		rf.unlock(" finishes preparing snapshot for %d with lastIncludedIndex: %d", server, rf.lastIncludedIndex)
 		reply := InstallSnapshotReply{}
 		ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 		if ok {
-			rf.lock("[%d] receives reply of sendSnapshot from %d", rf.me, server)
+			rf.lock(" receives reply of sendSnapshot from %d", server)
 			if reply.Term > rf.currentTerm {
-				logrus.Debugf("[%d]'s term %d is < %d's term %d", rf.me, args.LeaderTerm, server, reply.Term)
+				rf.Debugf(" term %d is < %d's term %d", args.LeaderTerm, server, reply.Term)
 				rf.updateCurrentTerm(reply.Term)
 				rf.killOldRole()
 			} else {
 				rf.nextIndex[server] = rf.lastIncludedIndex + 1
-				logrus.Debugf("[%d] new nextIndex[%d]: %d", rf.me, server, rf.nextIndex[server])
+				rf.Debugf(" new nextIndex[%d]: %d", server, rf.nextIndex[server])
 			}
-			rf.unlock("[%d] finishes sendSnapshot to %d", rf.me, server)
+			rf.unlock(" finishes sendSnapshot to %d", server)
 			return
 		}
 	}
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	rf.lock("[%d] starts to install snapshot", rf.me)
-	defer rf.unlock("[%d] finishes installing snapshot", rf.me)
+	rf.lock(" starts to install snapshot")
+	defer rf.unlock(" finishes installing snapshot")
 	reply.Term = rf.currentTerm
 	if args.LeaderTerm < rf.currentTerm {
-		logrus.Debugf("[%d]'s term %d > leader %d's term %d", rf.me, rf.currentTerm, args.LeaderId, args.LeaderTerm)
+		rf.Debugf(" term %d > leader %d's term %d", rf.currentTerm, args.LeaderId, args.LeaderTerm)
 		return
 	} else if args.LastIncludeIndex <= rf.lastIncludedIndex {
-		logrus.Infof("[%d] (lastIncludedIndex %d) receives a stale snapshot with lastIncludeIndex: %d!", rf.me, rf.lastIncludedIndex, args.LastIncludeIndex)
+		rf.Infof("(lastIncludedIndex %d) receives a stale snapshot with lastIncludeIndex: %d!", rf.lastIncludedIndex, args.LastIncludeIndex)
 		return
 	}
 
-	logrus.Infof("[%d] before installing snapshot: lastIncludedIndex %d, commitIndex %d, lastSent %d, log %d", rf.me, rf.lastIncludedIndex, rf.commitIndex, rf.lastSent, len(rf.log))
+	rf.Infof(" before installing snapshot: lastIncludedIndex %d, commitIndex %d, lastSent %d, log %d", rf.lastIncludedIndex, rf.commitIndex, rf.lastSent, len(rf.log))
 
 	data := rf.encodeRaftState()
 	rf.persister.SaveStateAndSnapshot(data, args.Data)
@@ -125,7 +124,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			Snapshot:          args.Data,
 			LastIncludedIndex: args.LastIncludeIndex,
 		}
-		logrus.Infof("[%d] sends a snapshot with lastIncludedIndex: %d to its kv peer!", rf.me, args.LastIncludeIndex)
+		rf.Infof(" sends a snapshot with lastIncludedIndex: %d to its kv peer!", args.LastIncludeIndex)
 		rf.applyCh <- applyMsg
 		rf.lastSent = args.LastIncludeIndex
 	}
@@ -133,5 +132,5 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedIndex = args.LastIncludeIndex
 	rf.lastIncludedTerm = args.LastIncludeTerm
 
-	logrus.Infof("[%d] new lastIncludeIndex: %d, commitIndex: %d, lastSent: %d, log: %d", rf.me, rf.lastIncludedIndex, rf.commitIndex, rf.lastSent, len(rf.log))
+	rf.Infof(" new lastIncludeIndex: %d, commitIndex: %d, lastSent: %d, log: %d", rf.lastIncludedIndex, rf.commitIndex, rf.lastSent, len(rf.log))
 }
