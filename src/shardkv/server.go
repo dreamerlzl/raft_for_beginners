@@ -254,7 +254,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 						}
 					}
 				} else {
-					kv.DPrintf("pull shard %d v %d from myself", me, sop.ver)
+					kv.DPrintf("shard %d pull v %d from myself", me, sop.ver)
 				}
 
 				op := Op{
@@ -277,12 +277,12 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				defer timer.Stop()
 				select {
 				case <-timer.C:
-					kv.DPrintf("timeout: pull shard %d for v %d", me, sop.ver)
+					kv.DPrintf("shard %d timeout for pulling v %d", me, sop.ver)
 					if 2*retryPull < 2000 {
 						retryPull = 2 * retryPull
 					}
 				case ver := <-kv.updateChan[me]:
-					kv.DPrintf("realize update shard %d v %d is issued", me, sop.ver)
+					kv.DPrintf("shard %d realize update v %d is issued", me, sop.ver)
 					if ver != sop.ver {
 						kv.DPrintf("shard %d wanted update ver: %d; given update ver: %d", me, sop.ver, ver)
 						// panic("unexpected update ver")
@@ -313,10 +313,10 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					kv.DPrintf("shard %d, skip v %d", me, kv.ver[me]+1)
 					// panic("unexpected pull")
 				}
-				kv.DPrintf("begins to pull shard %d for v %d", me, sop.ver)
+				// kv.DPrintf("shard %d begins to pull v %d", me, sop.ver)
 				pullChan <- sop
 			} else {
-				kv.DPrintf("sees outdated pull %d", sop.ver)
+				kv.DPrintf("shard %d sees outdated pull %d", me, sop.ver)
 			}
 		case Get:
 			sop := op.(Get)
@@ -375,7 +375,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				}()
 			} else if sop.ver == kv.ver[me]+1 {
 				kv.ver[me] = sop.ver
-				kv.DPrintf("updates shard %d to ver %d: %v", me, sop.ver, kv.data[me])
+				kv.DPrintf("shard %d updates to ver %d: %v", me, sop.ver, kv.data[me])
 			} else {
 				kv.DPrintf("sees outdated abandon: %d", sop.ver)
 			}
@@ -424,7 +424,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				kv.mu3.Unlock()
 				kv.DPrintf("shard %d, v %d: becomes valid", me, kv.ver[me])
 			} else if sop.ver > kv.ver[me]+1 {
-				kv.DPrintf("notices unexpected update shard %d v %d", me, sop.ver)
+				kv.DPrintf("shard %d update want %d, given %d", me, kv.ver[me]+1, sop.ver)
 				panic("unexpected update shard")
 			} else {
 				kv.DPrintf("notices outdated update shard %d v %d", me, sop.ver)
@@ -489,17 +489,17 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (Shar
 		select {
 		case v := <-kv.updateChan[shard]:
 			if v != ver {
-				kv.DPrintf("unexpected update shard %d v %d in pullFrom", shard, ver)
+				kv.DPrintf("shard %d update wanted %d, given %d", shard, ver, v)
 				panic("unexpected update shard in pullFrom")
 			}
-			kv.DPrintf("stops pulling shard %d v %d from %d", shard, ver, gid)
+			kv.DPrintf("shard %d: stops pulling v %d from %d", shard, ver, gid)
 			return ShardInfo{}, Stopped
 		default:
 		}
 		if kv.killed() {
 			return ShardInfo{}, Killed
 		}
-		kv.DPrintf("retry pulling shard %d version %d from %d...", shard, ver, gid)
+		kv.DPrintf("shard %d retry pulling v %d from %d...", shard, ver, gid)
 	}
 }
 
