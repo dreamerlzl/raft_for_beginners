@@ -10,6 +10,7 @@ package shardkv
 
 import (
 	"crypto/rand"
+	"fmt"
 	"log"
 	"math/big"
 	"sync"
@@ -18,6 +19,15 @@ import (
 	"../labrpc"
 	"../shardmaster"
 )
+
+const smDebug = false
+
+func (ck *Clerk) DPrintf(msg string, f ...interface{}) {
+	if smDebug {
+		log.Printf("[ck %d] %s", ck.clerkId, fmt.Sprintf(msg, f...))
+		// logrus.Debugf("[gid %d, kv %d, %d] %s", kv.gid, kv.me, fmt.Sprintf(msg, f...))
+	}
+}
 
 //
 // which shard is a key in?
@@ -93,7 +103,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 		si := ck.lastLeader[gid]
 		ck.mu.Unlock()
-		log.Printf("[ck %d][get %d] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, args.RequestId, key, shard, gid, ck.config.Num, ck.config.Shards)
+		ck.DPrintf("[get %d] sees key %s (shard %d) belong to groupd %d with config %d, %v", args.RequestId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			num := len(servers)
@@ -112,7 +122,7 @@ func (ck *Clerk) Get(key string) string {
 					ck.mu.Lock()
 					ck.lastLeader[gid] = si
 					ck.mu.Unlock()
-					log.Printf("[ck %d][get] errwronggroup: shard %d for group %d", ck.clerkId, shard, gid)
+					ck.DPrintf("[get %d] errwronggroup: shard %d for group %d", args.RequestId, shard, gid)
 					break
 				}
 				j++
@@ -149,7 +159,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			si = ck.lastLeader[gid]
 		}
 		ck.mu.Unlock()
-		log.Printf("[ck %d][pa %d] sees key %s (shard %d) belong to groupd %d with config %d, %v", ck.clerkId, args.RequestId, key, shard, gid, ck.config.Num, ck.config.Shards)
+		ck.DPrintf("[pa %d] sees key %s (shard %d) belong to groupd %d with config %d, %v", args.RequestId, key, shard, gid, ck.config.Num, ck.config.Shards)
 		var nextConfig bool
 		if servers, ok := ck.config.Groups[gid]; ok {
 			num := len(servers)
@@ -164,24 +174,24 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 						ck.mu.Lock()
 						ck.lastLeader[gid] = si
 						ck.mu.Unlock()
-						log.Printf("[ck %d][pa] finish %s %s %s at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
+						ck.DPrintf("[pa %d] finish %s %s %s at %d, %s", args.RequestId, op, key, value, gid, servers[si])
 						return
 					case ErrDuplicate:
 						ck.mu.Lock()
 						ck.lastLeader[gid] = si
 						ck.mu.Unlock()
-						log.Printf("[ck %d][pa] %s %s %s duplicate request at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
+						ck.DPrintf("[pa %d] %s %s %s duplicate request at %d, %s", args.RequestId, op, key, value, gid, servers[si])
 						return
 					case ErrWrongGroup:
 						nextConfig = true
-						log.Printf("[ck %d][pa] %s %s %s wrong group at %d, %s", ck.clerkId, op, key, value, gid, servers[si])
+						ck.DPrintf("[pa %d] %s %s %s wrong group at %d, %s", args.RequestId, op, key, value, gid, servers[si])
 						break
 					case ErrLagConfig:
 						time.Sleep(time.Millisecond * waitLagReplicaTime)
 					default:
 						j++
 						si = (si + 1) % num
-						log.Printf("[ck %d][pa] %s %s %s err: %v at %d, %s", ck.clerkId, op, key, value, reply.Err, gid, servers[si])
+						ck.DPrintf("[pa %d] %s %s %s err: %v at %d, %s", args.RequestId, op, key, value, reply.Err, gid, servers[si])
 					}
 					if nextConfig {
 						break

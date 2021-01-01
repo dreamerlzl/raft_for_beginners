@@ -84,7 +84,6 @@ func (cfg *config) checkTimeout() {
 func (cfg *config) cleanup() {
 	log.Printf("ngroups: %d", cfg.ngroups)
 	for gi := 0; gi < cfg.ngroups; gi++ {
-		log.Printf("kill gid %d", gi)
 		cfg.ShutdownGroup(gi)
 	}
 	cfg.net.Cleanup()
@@ -158,7 +157,6 @@ func (cfg *config) deleteClient(ck *Clerk) {
 
 // Shutdown i'th server of gi'th group, by isolating it
 func (cfg *config) ShutdownServer(gi int, i int) {
-	log.Printf("kill gid %d, kv %d", gi, i)
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 

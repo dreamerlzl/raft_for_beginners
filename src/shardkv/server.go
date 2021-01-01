@@ -16,7 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const Debug = true
+const kvDebug = false
 const (
 	checkSnapshotPeriod = 300
 	requestTimeout      = 300
@@ -1026,7 +1026,7 @@ func (writer logWriter) Write(bytes []byte) (int, error) {
 }
 
 func (kv *ShardKV) DPrintf(msg string, f ...interface{}) {
-	if Debug {
+	if kvDebug {
 		log.Printf("[gid %d, kv %d, %d] %s", kv.gid, kv.me, kv.uid, fmt.Sprintf(msg, f...))
 		// logrus.Debugf("[gid %d, kv %d, %d] %s", kv.gid, kv.me, fmt.Sprintf(msg, f...))
 	}
