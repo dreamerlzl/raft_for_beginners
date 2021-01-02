@@ -106,3 +106,10 @@ func mapKeys(data map[int]map[string]string) []int {
 	}
 	return keys
 }
+
+func MaxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

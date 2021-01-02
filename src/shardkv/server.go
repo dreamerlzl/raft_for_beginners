@@ -17,6 +17,7 @@ import (
 )
 
 const kvDebug = true
+const rfDebug = false
 const (
 	checkSnapshotPeriod = 300
 	requestTimeout      = 300
@@ -24,6 +25,7 @@ const (
 	waitLagReplicaTime  = 300
 	retryTime           = 300
 	delayedAbandonTime  = 200
+	waitIssueTime       = 200
 	issueTime           = 2 // assume 3 tries of issueing a log could succeed
 )
 const logLevel = logrus.DebugLevel
@@ -208,7 +210,6 @@ func (kv *ShardKV) updateConfig() {
 		}
 		kv.lastUpdatedConfig = i
 	}
-	kv.lastPollConfigNum = kv.lastUpdatedConfig
 	if kv.lastUpdatedConfig > kv.lastSeeConfig {
 		kv.lastSeeConfig = kv.lastUpdatedConfig
 	}
@@ -239,9 +240,10 @@ func (kv *ShardKV) giveShardOp(shard int, op ShardOp) {
 func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	// if ver is 1, then it means that if a client also realizes config version 1,
 	// then the client can contact this kv for requests.
-	pullAbandonChan := make(chan interface{}, 10)
-	go func(sops chan interface{}) {
+	pullAbandonChan := make(chan ShardOp, 10)
+	go func(sops chan ShardOp) {
 		for sop := range sops {
+			kv.DPrintf("shard %d, %s", me, sop.sop2string())
 			switch sop.(type) {
 			case Pull:
 				kv.pull(sop.(Pull), me)
@@ -276,9 +278,11 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					kv.DPrintf("shard %d, skip v %d", me, kv.ver[me]+1)
 					// panic("unexpected pull")
 				}
-				for i := lastPull + 1; i < sop.ver; i++ {
+				for i := MaxInt(lastPull, lastAbandon) + 1; i < sop.ver; i++ {
 					if kv.configs[i].Shards[me] == kv.gid {
 						pullAbandonChan <- Pull{ver: i}
+					} else {
+						pullAbandonChan <- InfoAbandon{ver: i}
 					}
 				}
 				lastPull = sop.ver
@@ -288,12 +292,14 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			}
 		case InfoAbandon:
 			sop := op.(InfoAbandon)
-			if sop.ver > kv.ver[me]+1 {
-				kv.DPrintf("shard %d, skip v %d", me, kv.ver[me]+1)
-			}
 			if sop.ver > kv.ver[me] {
-				for i := lastAbandon + 1; i < sop.ver; i++ {
-					if kv.configs[i].Shards[me] != kv.gid {
+				if sop.ver > kv.ver[me]+1 {
+					kv.DPrintf("shard %d, skip v %d", me, kv.ver[me]+1)
+				}
+				for i := MaxInt(lastPull, lastAbandon) + 1; i < sop.ver; i++ {
+					if kv.configs[i].Shards[me] == kv.gid {
+						pullAbandonChan <- Pull{ver: i}
+					} else {
 						pullAbandonChan <- InfoAbandon{ver: i}
 					}
 				}
@@ -383,7 +389,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 		case GetShard:
 			sop := op.(GetShard)
 			if sop.ver-1 > kv.lastValid[me] {
-				kv.DPrintf("ErrLagConfig: shard %d last valid version: %d, expected version: %d", me, kv.lastValid[me], sop.ver-1)
+				kv.DPrintf("shard %d last valid version: %d, expected version: %d", me, kv.lastValid[me], sop.ver-1)
 				sop.result <- ErrLagConfig
 			} else {
 				copy := shardCopy(kv.data[me])
@@ -392,7 +398,7 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					if sop.ver > kv.ver[me] {
 						kv.ver[me] = sop.ver
 					} // otherwise, put/append may still succeed
-					kv.DPrintf("transfers shard %d to %d for v %d!", me, sop.from, sop.ver)
+					kv.DPrintf("shard %d transferred to %d for v %d!", me, sop.from, sop.ver)
 				} else {
 					kv.DPrintf("gives meaningless shard %d to %d for v %d", me, sop.from, sop.ver)
 				}
@@ -445,7 +451,8 @@ const (
 )
 
 func (kv *ShardKV) toAbandon(sop InfoAbandon, me int) {
-	for i := 0; i < issueTime; i++ {
+	defer kv.DPrintf("shard %d finish abandoning v %d", me, sop.ver)
+	for {
 		op := Op{
 			Type:  "DelayedAbandon",
 			Ver:   sop.ver,
@@ -454,16 +461,24 @@ func (kv *ShardKV) toAbandon(sop InfoAbandon, me int) {
 		index, _, isLeader := kv.rf.Start(op)
 		if isLeader {
 			kv.DPrintf("issues abandon shard %d v %d at index %d", me, sop.ver, index)
+		}
+		time.Sleep(time.Millisecond * time.Duration(waitIssueTime))
+		kv.mu3.Lock()
+		ver := kv.ver[me]
+		kv.mu3.Unlock()
+		if ver >= sop.ver {
+			kv.DPrintf("shard %d realize abandon v %d finish", me, sop.ver)
 			return
 		}
 		if kv.killed() {
 			return
 		}
-		time.Sleep(time.Millisecond * time.Duration(raft.MaxElectionTimeout))
+		kv.DPrintf("shard %d retry abandoning for v %d", me, sop.ver)
 	}
 }
 
 func (kv *ShardKV) pull(sop Pull, me int) {
+	defer kv.DPrintf("shard %d finish pulling v %d", me, sop.ver)
 	var shardinfo ShardInfo
 	var status PullStatus
 	lastConfig := kv.configs[sop.ver-1]
@@ -474,7 +489,7 @@ func (kv *ShardKV) pull(sop Pull, me int) {
 	gid := lastConfig.Shards[me]
 	servers := lastConfig.Groups[gid]
 
-	for i := 0; i < issueTime; i++ {
+	for {
 		if gid != kv.gid {
 			_, isLeader := kv.rf.GetState()
 			if isLeader {
@@ -483,6 +498,8 @@ func (kv *ShardKV) pull(sop Pull, me int) {
 				if status == Killed || status == Stopped {
 					break
 				}
+			} else {
+				kv.DPrintf("thinks it's not a leader")
 			}
 		} else {
 			kv.DPrintf("shard %d pull v %d from myself", me, sop.ver)
@@ -502,12 +519,18 @@ func (kv *ShardKV) pull(sop Pull, me int) {
 		index, _, isLeader := kv.rf.Start(op) // only leader would succeed
 		if isLeader {
 			kv.DPrintf("issues update shard %d, v %d at index %d", me, sop.ver, index)
+		}
+		time.Sleep(time.Millisecond * time.Duration(waitIssueTime))
+		kv.mu3.Lock()
+		ver := kv.ver[me]
+		kv.mu3.Unlock()
+		if ver >= sop.ver {
+			kv.DPrintf("shard %d realize update v %d finish", me, sop.ver)
 			return
 		}
 		if kv.killed() {
 			return
 		}
-		time.Sleep(time.Millisecond * time.Duration(raft.MaxElectionTimeout))
 		kv.DPrintf("shard %d retry pulling for v %d", me, sop.ver)
 	}
 }
@@ -527,6 +550,7 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (Shar
 		kv.mu2.Unlock()
 		for j < num {
 			srv := kv.make_end(servers[si])
+			kv.DPrintf("shard %d starts to call %s getshard for v %d", shard, servers[si], ver)
 			ok := srv.Call("ShardKV.GetShard", &args, &reply)
 			if ok {
 				switch reply.Err {
@@ -558,10 +582,12 @@ func (kv *ShardKV) pullFrom(gid int, shard int, ver int, servers []string) (Shar
 			return ShardInfo{}, Killed
 		}
 		kv.mu3.Lock()
-		if kv.ver[shard] >= ver {
+		v := kv.ver[shard]
+		kv.mu3.Unlock()
+		if v >= ver {
 			return ShardInfo{}, Stopped
 		}
-		kv.mu3.Unlock()
+		time.Sleep(time.Duration(retryTime) * time.Millisecond)
 		kv.DPrintf("shard %d retry pulling v %d from %d...", shard, ver, gid)
 	}
 }
@@ -776,6 +802,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.killedChan = make(chan bool, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	if rfDebug {
+		kv.rf.Log()
+	}
 	// read snapshot
 	kv.loadSnapshot(kv.rf.GetSnapshot())
 	kv.DPrintf("is started with lastPollConfigNum: %d", kv.lastPollConfigNum)
@@ -819,7 +848,8 @@ func (kv *ShardKV) checkApply() {
 			if applyMsg.CommandValid {
 				if kv.applyIndex+1 != applyMsg.CommandIndex {
 					kv.DPrintf("application not in order! expected: %d, given: %d", kv.applyIndex+1, applyMsg.CommandIndex)
-					panic("application not in order")
+					// panic("application not in order")
+					break
 				}
 				op := applyMsg.Command.(Op)
 				kv.lock("receives applyMsg index %v %s", applyMsg.CommandIndex, op2string(op))
@@ -985,10 +1015,7 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 }
 
 func (kv *ShardKV) pollConfig() {
-	if kv.lastPollConfigNum > kv.lastUpdatedConfig {
-		// for restart with snapshot; maybe killed during updating to a new config
-		kv.lastPollConfigNum = kv.lastUpdatedConfig
-	}
+	kv.lastPollConfigNum = len(kv.configs) - 1
 	kv.DPrintf("begins polling with %d", kv.lastPollConfigNum)
 	for {
 		_, isLeader := kv.rf.GetState()
@@ -1006,10 +1033,15 @@ func (kv *ShardKV) pollConfig() {
 				}
 				index, _, isLeader := kv.rf.Start(op)
 				if isLeader {
-					kv.lastPollConfigNum++
-					kv.DPrintf("issues %s at index %d", op2string(op), index)
-				} else {
-					kv.DPrintf("fail to issue %s at index %d", op2string(op), index)
+					kv.DPrintf("config %d issued at index %d", config.Num, index)
+				}
+				time.Sleep(time.Millisecond * time.Duration(waitIssueTime))
+				kv.lock("read last added config")
+				l := len(kv.configs) - 1
+				kv.unlock("finish read last added config")
+				if l >= config.Num {
+					kv.DPrintf("config %d realize issued", config.Num)
+					kv.lastPollConfigNum = l
 				}
 			}
 		}
@@ -1030,9 +1062,9 @@ func (kv *ShardKV) encodeSnapshot() []byte {
 	if e.Encode(kv.applyIndex) != nil {
 		panic("fail to encode kv.applyIndex!")
 	}
-	if e.Encode(kv.lastPollConfigNum) != nil {
-		panic("fail to encode kv.lastConfigVer!")
-	}
+	// if e.Encode(kv.lastPollConfigNum) != nil {
+	// 	panic("fail to encode kv.lastConfigVer!")
+	// }
 	if e.Encode(kv.configs) != nil {
 		panic("fail to encode kv.configs")
 	}
@@ -1065,14 +1097,14 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		var lastRequestId []map[int64]map[int64]bool
 		var lastUpdatedConfig int
 		var applyIndex int
-		var lastPollConfigNum int
+		// var lastPollConfigNum int
 		var configs []shardmaster.Config
 		var ver []int
 		var lastValid []int
 		var toGet map[int]int
 		if d.Decode(&lastUpdatedConfig) != nil ||
 			d.Decode(&applyIndex) != nil ||
-			d.Decode(&lastPollConfigNum) != nil ||
+			// d.Decode(&lastPollConfigNum) != nil ||
 			d.Decode(&configs) != nil ||
 			d.Decode(&data) != nil ||
 			d.Decode(&lastRequestId) != nil ||
@@ -1090,7 +1122,7 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		kv.data = data
 		kv.lastRequestId = lastRequestId
 		kv.configs = configs
-		kv.lastPollConfigNum = lastPollConfigNum
+		// kv.lastPollConfigNum = lastPollConfigNum
 		kv.ver = ver
 		kv.lastValid = lastValid
 		kv.toGet = toGet
