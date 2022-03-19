@@ -1,20 +1,17 @@
 package kvraft
 
-import (
-	"fmt"
-	"io/ioutil"
-	"log"
-	"math/rand"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"testing"
-	"time"
-
-	"../models"
-	"../porcupine"
-)
+import "../porcupine"
+import "../models"
+import "testing"
+import "strconv"
+import "time"
+import "math/rand"
+import "log"
+import "strings"
+import "sync"
+import "sync/atomic"
+import "fmt"
+import "io/ioutil"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -351,8 +348,7 @@ func GenericTestLinearizability(t *testing.T, part string, nclients int, nserver
 				nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
 				var inp models.KvInput
 				var out models.KvOutput
-				startTime := time.Since(begin)
-				start := int64(startTime)
+				start := int64(time.Since(begin))
 				if (rand.Int() % 1000) < 500 {
 					Append(cfg, myck, key, nv)
 					inp = models.KvInput{Op: 2, Key: key, Value: nv}
@@ -366,9 +362,7 @@ func GenericTestLinearizability(t *testing.T, part string, nclients int, nserver
 					inp = models.KvInput{Op: 0, Key: key}
 					out = models.KvOutput{Value: v}
 				}
-				endTime := time.Since(begin)
-				end := int64(endTime)
-				DPrintf("client:%v\tinput:%s\toutput:%v\tstart:%s\tend:%s", cli, inp.ToString(), out, startTime.String(), endTime.String())
+				end := int64(time.Since(begin))
 				op := porcupine.Operation{Input: inp, Call: start, Output: out, Return: end, ClientId: cli}
 				opMu.Lock()
 				operations = append(operations, op)
