@@ -11,10 +11,10 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
-	logrus "github.com/sirupsen/logrus"
+	//logrus "github.com/sirupsen/logrus"
 )
 
-const Debug = 1
+const Debug = 0 
 const checkLeaderPeriod = 20
 const checkSnapshotPeriod = 150
 const ratio float32 = 0.90 // when rf.RaftStateSize >= ratio * kv.maxraftestatesize, take a snapshot
@@ -227,10 +227,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 						// duplicate execution
 						DPrintf("[kv %d] detects duplicate request %d", kv.me, op.RequestId)
 					} else {
-						logrus.Debugf("[kv %d] keyL %v value: %v before applying index:%d", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
+						// logrus.Debugf("[kv %d] keyL %v value: %v before applying index:%d", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 						kv.applyOp(op)
 						kv.lastRequestId[op.ClerkId] = op.RequestId
-						logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
+						// logrus.Debugf("[kv %d] key: %v value: %v after applying index: %d", kv.me, op.Key, kv.data[op.Key], applyMsg.CommandIndex)
 					}
 				}
 				kv.applyIndex++
@@ -245,7 +245,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// periodically check whether need to take a snapshot
 	go func() {
 		for {
-			if kv.rf.GetStateSize() >= int(ratio*float32(kv.maxraftstate)) {
+			if kv.maxraftstate > -1 && kv.rf.GetStateSize() >= int(ratio*float32(kv.maxraftstate)) {
 				kv.lock("[kv %d] starts to encode snapshot", kv.me)
 				snapshot := kv.encodeSnapshot()
 				applyIndex := kv.applyIndex

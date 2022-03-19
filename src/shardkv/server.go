@@ -16,7 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const kvDebug = true
+const kvDebug = false
 const rfDebug = false
 const (
 	checkSnapshotPeriod = 300
@@ -194,7 +194,7 @@ type ShardKV struct {
 	mu2               sync.Mutex //to avoid concurrent hashmap write of kv.shardOp and kv.lastLeader
 	mu3               sync.Mutex // sync toGet
 	lastLeader        map[int]int
-	toGet             map[int]int
+	shardsToGet       map[int]int
 	// to ensure that when the leader fails during a reconfig,
 	// the new leader can retry the reconfig
 	dead          int32
@@ -205,7 +205,7 @@ type ShardKV struct {
 
 func (kv *ShardKV) updateConfig() {
 	for i := kv.lastUpdatedConfig + 1; ; i++ {
-		if v, ok := kv.toGet[i]; !ok || v > 0 {
+		if v, ok := kv.shardsToGet[i]; !ok || v > 0 {
 			break
 		}
 		kv.lastUpdatedConfig = i
@@ -383,12 +383,12 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					}
 				}()
 			} else if sop.ver == kv.ver[me]+1 || sop.ver == kv.ver[me] {
-				if _, ok := kv.toGet[sop.ver]; ok {
+				if _, ok := kv.shardsToGet[sop.ver]; ok {
 					kv.ver[me] = sop.ver
 					lastAbandon = sop.ver
-					kv.toGet[sop.ver]--
-					kv.DPrintf("to get %d for config %d", kv.toGet[sop.ver], sop.ver)
-					if kv.toGet[sop.ver] == 0 && sop.ver == kv.lastUpdatedConfig+1 {
+					kv.shardsToGet[sop.ver]--
+					kv.DPrintf("to get %d for config %d", kv.shardsToGet[sop.ver], sop.ver)
+					if kv.shardsToGet[sop.ver] == 0 && sop.ver == kv.lastUpdatedConfig+1 {
 						kv.updateConfig()
 					}
 				} else {
@@ -432,10 +432,10 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 					kv.data[me] = shardCopy(sop.shardinfo.Data)
 					kv.lastRequestId[me] = lastRequestCopy(sop.shardinfo.LastRequestId)
 				}
-				if _, ok := kv.toGet[sop.ver]; ok {
-					kv.toGet[sop.ver]--
-					kv.DPrintf("to get %d for config %d", kv.toGet[sop.ver], sop.ver)
-					if kv.toGet[sop.ver] == 0 && sop.ver == kv.lastUpdatedConfig+1 {
+				if _, ok := kv.shardsToGet[sop.ver]; ok {
+					kv.shardsToGet[sop.ver]--
+					kv.DPrintf("to get %d for config %d", kv.shardsToGet[sop.ver], sop.ver)
+					if kv.shardsToGet[sop.ver] == 0 && sop.ver == kv.lastUpdatedConfig+1 {
 						kv.updateConfig()
 					}
 				} else {
@@ -806,7 +806,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.data = make([]map[string]string, shardmaster.NShards)
 	kv.ver = make([]int, shardmaster.NShards)
 	kv.lastValid = make([]int, shardmaster.NShards)
-	kv.toGet = make(map[int]int)
+	kv.shardsToGet = make(map[int]int)
 
 	kv.lastRequestId = make([]map[int64]map[int64]bool, shardmaster.NShards)
 	for i := 0; i < shardmaster.NShards; i++ {
@@ -978,8 +978,8 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 			return OK
 		}
 
-		if _, ok := kv.toGet[config.Num]; !ok {
-			kv.toGet[config.Num] = len(config.Shards)
+		if _, ok := kv.shardsToGet[config.Num]; !ok {
+			kv.shardsToGet[config.Num] = len(config.Shards)
 		}
 		if config.Num > len(kv.configs)-1 {
 			if config.Num != len(kv.configs) {
@@ -1000,8 +1000,8 @@ func (kv *ShardKV) applyOp(op Op) interface{} {
 				kv.giveShardOp(i, InfoAbandon{ver: config.Num})
 			}
 		}
-		kv.DPrintf("to get %d shards for config %d", kv.toGet[config.Num], config.Num)
-		if kv.toGet[config.Num] == 0 && config.Num == kv.lastUpdatedConfig+1 {
+		kv.DPrintf("to get %d shards for config %d", kv.shardsToGet[config.Num], config.Num)
+		if kv.shardsToGet[config.Num] == 0 && config.Num == kv.lastUpdatedConfig+1 {
 			kv.updateConfig()
 		}
 	case "UpdateShard":
@@ -1107,7 +1107,7 @@ func (kv *ShardKV) encodeSnapshot() []byte {
 	if e.Encode(kv.lastValid) != nil {
 		panic("fail to encode kv.valid")
 	}
-	if e.Encode(kv.toGet) != nil {
+	if e.Encode(kv.shardsToGet) != nil {
 		panic("fail to encode kv.toGet!")
 	}
 	kv.mu3.Unlock()
@@ -1152,7 +1152,7 @@ func (kv *ShardKV) loadSnapshot(snapshot []byte) {
 		// kv.lastPollConfigNum = lastPollConfigNum
 		kv.ver = ver
 		kv.lastValid = lastValid
-		kv.toGet = toGet
+		kv.shardsToGet = toGet
 		// kv.DPrintf("loads config: %v, \ndata: %v", kv.configs, kv.data)
 		kv.unlock("load snapshot with applyIndex: %d, last updated config: %d", kv.applyIndex, kv.lastUpdatedConfig)
 	}

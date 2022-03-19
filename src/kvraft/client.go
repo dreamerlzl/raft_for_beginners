@@ -9,7 +9,7 @@ import (
 	logrus "github.com/sirupsen/logrus"
 )
 
-var kvlogLevel = logrus.DebugLevel
+var kvlogLevel = logrus.InfoLevel
 var rpcTimeout = 500
 
 type Clerk struct {

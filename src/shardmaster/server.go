@@ -13,8 +13,8 @@ import (
 	"../raft"
 )
 
-const smDebug = false
-const rfDebug = true
+const smDebug = true
+const rfDebug = false
 const (
 	checkLeaderPeriod   = 50
 	checkSnapshotPeriod = 150
@@ -260,7 +260,7 @@ func (sm *ShardMaster) checkApplyMsg() {
 				panic("application not in order")
 			}
 			op := applyMsg.Command.(Op)
-			sm.lock("starts to apply index %d, op %s", applyMsg.CommandIndex, op2string(op))
+			sm.lock("starts to apply index %d, op %s\ngid2shards: %v", applyMsg.CommandIndex, op2string(op), sm.gid2shards)
 			if op.Type == query {
 				var r interface{} = InvalidNum
 				if op.Num < len(sm.configs) && op.Num >= 0 {
@@ -278,7 +278,7 @@ func (sm *ShardMaster) checkApplyMsg() {
 				}
 			}
 			sm.applyIndex++
-			sm.unlock("ends applying index %d, op %s", applyMsg.CommandIndex, op2string(op))
+			sm.unlock("ends applying index %d, op %s\ngid2shards: %v", applyMsg.CommandIndex, op2string(op), sm.gid2shards)
 		} else {
 			// reserved for snapshots!
 			sm.loadSnapshot(applyMsg.Snapshot)
