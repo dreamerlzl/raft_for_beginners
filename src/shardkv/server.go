@@ -244,12 +244,12 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	pullAbandonChan := make(chan interface{}, 10)
 	go func(sops chan interface{}) {
 		for sop := range sops {
-			switch sop.(type) {
+			switch v := sop.(type) {
 			case Pull:
-				kv.DPrintf("shard %d, %s", me, sop.(Pull).sop2string())
+				kv.DPrintf("shard %d, %s", me, v.sop2string())
 				kv.pull(sop.(Pull), me)
 			case InfoAbandon:
-				kv.DPrintf("shard %d, %s", me, sop.(InfoAbandon).sop2string())
+				kv.DPrintf("shard %d, %s", me, v.sop2string())
 				kv.toAbandon(sop.(InfoAbandon), me)
 			}
 		}
@@ -267,12 +267,11 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 	for {
 		op := <-ops
 		kv.DPrintf(fmt.Sprintf("shard %d ver %d: ", me, kv.ver[me]) + op.sop2string())
-		switch op.(type) {
+		switch sop := op.(type) {
 		case Terminate:
 			close(pullAbandonChan)
 			return
 		case Pull:
-			sop := op.(Pull)
 			kv.lock3("shard %d read ver", me)
 			ver := kv.ver[me]
 			kv.unlock3("shard %d finish read ver", me)
@@ -294,7 +293,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				kv.DPrintf("shard %d sees outdated pull %d", me, sop.ver)
 			}
 		case InfoAbandon:
-			sop := op.(InfoAbandon)
 			kv.lock3("shard %d read ver", me)
 			ver := kv.ver[me]
 			kv.unlock3("shard %d finish read ver", me)
@@ -316,7 +314,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 				kv.DPrintf("shard %d sees outdated InfoAbandon %d", me, sop.ver)
 			}
 		case Get:
-			sop := op.(Get)
 			kv.lock3("shard %d read ver", me)
 			if sop.ver > kv.lastValid[me] {
 				sop.result <- ErrLagConfig
@@ -332,7 +329,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			}
 			kv.unlock3("shard %d finish read ver", me)
 		case Put:
-			sop := op.(Put)
 			kv.lock3("shard %d read ver", me)
 			if sop.ver > kv.lastValid[me] {
 				sop.result <- ErrLagConfig
@@ -344,7 +340,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			}
 			kv.unlock3("shard %d finish read ver", me)
 		case Append:
-			sop := op.(Append)
 			kv.lock3("shard %d read ver", me)
 			if sop.ver > kv.lastValid[me] {
 				sop.result <- ErrLagConfig
@@ -360,7 +355,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			}
 			kv.unlock3("shard %d finish read ver", me)
 		case Abandon:
-			sop := op.(Abandon)
 			kv.lock3("shard %d read ver", me)
 			if sop.ver > kv.ver[me]+1 {
 				// this abandon appears earlier than the finish of last update
@@ -402,7 +396,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			sop.result <- true
 			kv.unlock3("shard %d finish read ver", me)
 		case GetShard:
-			sop := op.(GetShard)
 			kv.lock3("shard %d read ver", me)
 			if sop.ver-1 > kv.lastValid[me] {
 				kv.DPrintf("ErrLagConfig: shard %d last valid version: %d, expected version: %d", me, kv.lastValid[me], sop.ver-1)
@@ -421,7 +414,6 @@ func (kv *ShardKV) handleShardOp(me int, ops chan ShardOp) {
 			}
 			kv.unlock3("shard %d finish read ver", me)
 		case UpdateShard:
-			sop := op.(UpdateShard)
 			kv.lock3("shard %d read ver", me)
 			if sop.ver == kv.ver[me]+1 {
 				if sop.changed {
